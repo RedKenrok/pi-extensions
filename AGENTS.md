@@ -1,0 +1,2 @@
+- Use gpt5.6-luna (xhigh) agents for exploration.
+- Run the linter (`npm run lint`) and tests (`npm run test`) after changing code.

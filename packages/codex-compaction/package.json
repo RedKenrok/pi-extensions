@@ -1,0 +1,21 @@
+{
+	"name": "codex-compaction",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"test": "node --test --experimental-strip-types tests/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": ">=0.85.1 <0.86.0"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}
