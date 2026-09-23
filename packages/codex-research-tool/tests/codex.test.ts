@@ -330,13 +330,13 @@ test("discovers and caches Luna per account when available", async () => {
 				models: [
 					{ slug: "first" },
 					{ slug: "default", is_default: true },
-					{ slug: "gpt-5.6-luna" },
+					{ slug: "gpt-6-luna" },
 				],
 			});
 		},
 	});
-	assert.equal(await client.selectModel(auth), "gpt-5.6-luna");
-	assert.equal(await client.selectModel(auth), "gpt-5.6-luna");
+	assert.equal(await client.selectModel(auth), "gpt-6-luna");
+	assert.equal(await client.selectModel(auth), "gpt-6-luna");
 	assert.equal(calls, 1);
 });
 

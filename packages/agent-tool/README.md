@@ -77,7 +77,7 @@ Start a background child:
 {
   "action": "spawn",
   "name": "auth-review",
-  "model": { "provider": "openai-codex", "id": "gpt-5.6-luna" },
+  "model": { "provider": "openai-codex", "id": "gpt-6-luna" },
   "prompt": "Review authentication. Report correctness issues with file and line references. Do not edit files.",
   "instructions": "Order findings by severity and identify missing evidence.",
   "tools": ["read", "grep", "find", "ls"],
@@ -174,7 +174,7 @@ If the parent has the `research` tool active, a child can receive it explicitly:
 {
   "action": "spawn",
   "name": "standards-research",
-  "model": { "provider": "openai-codex", "id": "gpt-5.6-luna" },
+  "model": { "provider": "openai-codex", "id": "gpt-6-luna" },
   "prompt": "Research the current primary-source guidance and return a cited answer.",
   "tools": ["research"],
   "requestId": "standards-research-v1"

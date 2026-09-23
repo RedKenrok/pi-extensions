@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ContractError, errorResult, validateAction } from "../src/contract.ts";
 
-const model = { provider: "openai-codex", id: "gpt-5.6-luna" } as const;
+const model = { provider: "openai-codex", id: "gpt-6-luna" } as const;
 
 test("contract rejects unknown fields and oversized/invalid waits before enqueue", () => {
 	assert.throws(

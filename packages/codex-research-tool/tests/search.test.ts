@@ -73,7 +73,7 @@ test("passes an exact per-call model override through catalog validation", async
 		selectModel: async (_auth, _signal, requestedModel, effort) => {
 			requested = requestedModel;
 			requestedEffort = effort;
-			return requestedModel ?? "gpt-5.6-luna";
+			return requestedModel ?? "gpt-6-luna";
 		},
 		runResearch: async (options) => {
 			sentModel = options.model;
@@ -115,7 +115,7 @@ test("trims input without rewriting it and uses a non-Codex conversation model i
 	const client = fakeClient({
 		selectModel: async () => {
 			selected = true;
-			return "gpt-5.6-luna";
+			return "gpt-6-luna";
 		},
 		runResearch: async (options) => {
 			sentQuery = options.query;
@@ -141,7 +141,7 @@ test("trims input without rewriting it and uses a non-Codex conversation model i
 	);
 	assert.equal(sentQuery, "exact question");
 	assert.equal(selected, true);
-	assert.equal(result.details.model, "gpt-5.6-luna");
+	assert.equal(result.details.model, "gpt-6-luna");
 });
 
 test("rejects empty and overlong input before auth or transport", async (t) => {

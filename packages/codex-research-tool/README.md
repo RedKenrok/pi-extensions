@@ -67,7 +67,7 @@ The complete public tool contract is:
 ```json
 {
   "query": "Which Node.js release line is currently Active LTS, and what primary source confirms it?",
-  "model": "gpt-5.6-luna",
+  "model": "gpt-6-luna",
   "effort": "high"
 }
 ```
@@ -110,7 +110,7 @@ Each call sends one self-contained query to the fixed Codex subscription backend
 
 Web search is performed inside the Codex response by the backend's `web_search` tool. The extension observes search activity and receives the synthesized answer and URL annotations, but it does not expose a browser session, page bodies, navigation controls, cookies, or caller-selected requests. Consequently, `research` is a one-shot research-answer interface rather than standalone browsing. Use a separate HTTP retrieval tool when a caller needs to choose and inspect a specific URL.
 
-When `model` is omitted, model discovery prefers `gpt-5.6-luna` when the account offers it, then uses the catalog's declared default or first available model. A tool call may override that choice with an exact model ID available to the same authenticated ChatGPT account and may supply its `effort`. If either choice is unavailable, the tool returns an `invalid_input` error containing the available model IDs and each model's advertised reasoning levels, including its default when reported.
+When `model` is omitted, model discovery prefers `gpt-6-luna` when the account offers it, then uses the catalog's declared default or first available model. A tool call may override that choice with an exact model ID available to the same authenticated ChatGPT account and may supply its `effort`. If either choice is unavailable, the tool returns an `invalid_input` error containing the available model IDs and each model's advertised reasoning levels, including its default when reported.
 
 The extension uses these fixed endpoints:
 
@@ -161,10 +161,6 @@ An offline RPC load check can be run from the repository root:
 printf '%s\n' '{"id":"state","type":"get_state"}' | \
   pi --mode rpc --offline --no-session --no-context-files -e ./packages/codex-research-tool
 ```
-
-### Live validation
-
-An authenticated smoke test passed on 19 September 2026 with Pi 0.85.1 and `gpt-5.6-luna`. A query about the current Node.js Active LTS line completed with required web-search activity and an HTTPS citation to the Node.js Release Working Group. Offline tests separately cover invocation from a non-Codex conversation model.
 
 ## Known limitations
 

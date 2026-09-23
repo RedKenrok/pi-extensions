@@ -121,7 +121,7 @@ test("spawn output makes a known provider block and recovery action explicit", (
 		state: "blocked",
 		reason: "quota_manual_resume_required",
 		effective: {
-			model: { provider: "openai-codex", id: "gpt-5.6-luna" },
+			model: { provider: "openai-codex", id: "gpt-6-luna" },
 			reasoning: "high",
 			cwd: "/tmp/project",
 		},
@@ -142,7 +142,7 @@ test("spawn output explains automatic completion without requiring idle", () => 
 		runId: "run_1",
 		state: "running",
 		effective: {
-			model: { provider: "openai-codex", id: "gpt-5.6-luna" },
+			model: { provider: "openai-codex", id: "gpt-6-luna" },
 			reasoning: "high",
 			cwd: "/tmp/project",
 			limits: { runtimeSeconds: 3600 },

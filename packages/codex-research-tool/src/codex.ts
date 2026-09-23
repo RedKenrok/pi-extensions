@@ -5,7 +5,7 @@ export const CODEX_RESPONSES_URL = `${CODEX_ORIGIN}/backend-api/codex/responses`
 export const CODEX_MODELS_URL = `${CODEX_ORIGIN}/backend-api/codex/models`;
 export const MAX_STREAM_BYTES = 2 * 1024 * 1024;
 export const MAX_SSE_FRAME_BYTES = 256 * 1024;
-export const DEFAULT_RESEARCH_MODEL = "gpt-5.6-luna";
+export const DEFAULT_RESEARCH_MODEL = "gpt-6-luna";
 // This identifies the Codex wire-protocol compatibility implemented here. It is
 // deliberately independent from the host Pi version: the models endpoint uses
 // this value to hide models whose protocol requirements are newer than the
