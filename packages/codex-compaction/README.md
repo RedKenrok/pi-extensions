@@ -45,4 +45,4 @@ Design and interoperability were checked against these upstream projects; no imp
 - [OpenAI Node SDK Responses types](https://github.com/openai/openai-node/tree/master/src/resources/responses) — public Responses item and `compaction_trigger` shapes.
 - [Pi compaction documentation](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/compaction.md) — Pi's compaction boundary, extension hooks, and session entries.
 
-This package targets `@earendil-works/pi-coding-agent >=0.85.1 <0.86.0` and uses Pi's exported `compact()` helper and public SDK payload hook. It does not copy upstream source.
+This package targets `@earendil-works/pi-coding-agent >=0.85.1` and uses Pi's exported `compact()` helper and public SDK payload hook. It does not copy upstream source.

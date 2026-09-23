@@ -22,7 +22,7 @@ Children use Pi's own conversations and authenticated models. The supervisor add
 ## Requirements
 
 - Node.js 22.19 or newer.
-- Pi `0.85.1`. The runtime dependency is pinned exactly and the peer range is `>=0.85.1 <0.86.0`.
+- Pi `>=0.85.1`.
 - A model already authenticated through Pi for real child runs.
 - Git when using isolated worktrees.
 

@@ -250,7 +250,6 @@ abortable.session.dispose();
 console.log(
 	JSON.stringify(
 		{
-			piVersion: "0.85.1",
 			durableCreateOpen: true,
 			literalTransport: true,
 			modelReasoningDiscovery: true,

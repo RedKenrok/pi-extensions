@@ -52,10 +52,7 @@ function statusText(
 }
 
 export interface ResearchExtensionDependencies {
-	piVersion?: string;
 	codexClientVersion?: string;
-	/** @deprecated Use piVersion. */
-	version?: string;
 	readCredential?: typeof readStoredCredential;
 	resolveAccessToken?: (
 		ctx: ExtensionContext | undefined,
@@ -68,7 +65,6 @@ export function createResearchExtension(
 	dependencies: ResearchExtensionDependencies = {},
 ): (pi: ExtensionAPI) => void {
 	return (pi: ExtensionAPI): void => {
-		const piVersion = dependencies.piVersion ?? dependencies.version ?? VERSION;
 		let generation = 0;
 		let registered = false;
 		let availability: Availability = { kind: "unchecked" };

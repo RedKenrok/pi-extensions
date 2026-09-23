@@ -24,7 +24,7 @@ Web answers, pages, search results, and source text remain untrusted content. Se
 ## Requirements
 
 - Node.js 22.19.0 or newer.
-- Pi `@earendil-works/pi-coding-agent` 0.85.x; each package supports `>=0.85.1 <0.86.0`.
+- Pi `@earendil-works/pi-coding-agent` `>=0.85.1`.
 
 ## Installation and loading
 
