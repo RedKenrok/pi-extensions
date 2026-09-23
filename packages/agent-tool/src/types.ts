@@ -152,10 +152,8 @@ export type AgentAction =
 			action: "inspect";
 			agentId: string;
 			afterEventId?: number;
-			includeOutput?: boolean;
-			cursor?: string;
 	  }
-	| { action: "inspect_many"; agentIds: string[]; includeOutput?: boolean }
+	| { action: "inspect_many"; agentIds: string[] }
 	| {
 			action: "wait";
 			agentIds: string[];

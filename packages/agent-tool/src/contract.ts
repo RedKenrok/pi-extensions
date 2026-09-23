@@ -90,7 +90,7 @@ export const agentParameters = Type.Union([
 		{
 			additionalProperties: false,
 			description:
-				"Start a background agent and return immediately. Continue independent work; use idle rather than polling when its result becomes the only blocker.",
+				"Start a background agent and return immediately. Continue independent work or end the parent turn; completion is delivered automatically without polling or an idle call.",
 		},
 	),
 	Type.Object(
@@ -119,8 +119,6 @@ export const agentParameters = Type.Union([
 			action: Type.Literal("inspect"),
 			...commonAgentId,
 			afterEventId: Type.Optional(Type.Integer({ minimum: 0 })),
-			includeOutput: Type.Optional(Type.Boolean()),
-			cursor: Type.Optional(Type.String()),
 		},
 		{ additionalProperties: false },
 	),
@@ -128,7 +126,6 @@ export const agentParameters = Type.Union([
 		{
 			action: Type.Literal("inspect_many"),
 			agentIds,
-			includeOutput: Type.Optional(Type.Boolean()),
 		},
 		{ additionalProperties: false },
 	),
@@ -162,7 +159,7 @@ export const agentParameters = Type.Union([
 		{
 			additionalProperties: false,
 			description:
-				"Arm a completion condition when agent results are the only remaining blocker, then end the parent turn. The harness resumes the parent automatically.",
+				"Join a specific agent group under a completion condition and coalesce its notifications. Use only as the final action when group aggregation, quorum, fail-fast, or headless continuation is needed; ordinary completions resume the parent automatically.",
 		},
 	),
 	Type.Object(
@@ -259,14 +256,8 @@ const allowedKeys: Record<AgentAction["action"], Set<string>> = {
 		"requestId",
 	]),
 	list: new Set(["action", "state", "cursor"]),
-	inspect: new Set([
-		"action",
-		"agentId",
-		"afterEventId",
-		"includeOutput",
-		"cursor",
-	]),
-	inspect_many: new Set(["action", "agentIds", "includeOutput"]),
+	inspect: new Set(["action", "agentId", "afterEventId"]),
+	inspect_many: new Set(["action", "agentIds"]),
 	wait: new Set(["action", "agentIds", "afterEventId", "timeoutMs"]),
 	idle: new Set([
 		"action",
@@ -576,8 +567,12 @@ export function validateAction(value: unknown): asserts value is AgentAction {
 		);
 }
 
-export function result(content: string, details: unknown) {
-	return { content: [{ type: "text" as const, text: content }], details };
+export function result(content: string, details: unknown, terminate = false) {
+	return {
+		content: [{ type: "text" as const, text: content }],
+		details,
+		...(terminate ? { terminate: true as const } : {}),
+	};
 }
 
 export function errorResult(error: unknown, state?: AgentState) {

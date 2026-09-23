@@ -35,6 +35,8 @@ function setup(
 	let compactOptions: CompactOptions | undefined;
 	const sent: string[] = [];
 	const notifications: Array<[string, string]> = [];
+	let idle = options.idle ?? true;
+	let pending = options.pending ?? false;
 	const pi = {
 		registerTool(value: unknown) {
 			tool = value as RegisteredTool;
@@ -53,8 +55,8 @@ function setup(
 		compact(value: CompactOptions) {
 			compactOptions = value;
 		},
-		isIdle: () => options.idle ?? true,
-		hasPendingMessages: () => options.pending ?? false,
+		isIdle: () => idle,
+		hasPendingMessages: () => pending,
 	};
 	assert.ok(tool);
 	return {
@@ -62,6 +64,12 @@ function setup(
 		ctx,
 		sent,
 		notifications,
+		setIdle: (value: boolean) => {
+			idle = value;
+		},
+		setPending: (value: boolean) => {
+			pending = value;
+		},
 		getCompactOptions: () => compactOptions,
 	};
 }
@@ -133,10 +141,26 @@ describe("compact tool", () => {
 		assert.ok(options);
 		options.onComplete();
 		options.onComplete();
+		options.onError(new Error("late failure"));
 		assert.deepEqual(state.sent, []);
 		await flushMicrotasks();
 		assert.equal(state.sent.length, 1);
 		assert.match(state.sent[0] ?? "", /Do not call compact again/);
+		assert.deepEqual(state.notifications, []);
+	});
+
+	it("rechecks idle and pending state before synthetic continuation", async () => {
+		for (const block of [
+			(state: ReturnType<typeof setup>) => state.setIdle(false),
+			(state: ReturnType<typeof setup>) => state.setPending(true),
+		]) {
+			const state = setup();
+			await state.tool.execute("call", {}, undefined, undefined, state.ctx);
+			state.getCompactOptions()?.onComplete();
+			block(state);
+			await flushMicrotasks();
+			assert.deepEqual(state.sent, []);
+		}
 	});
 
 	it("does not continue when busy or when user messages are pending", async () => {
@@ -154,6 +178,7 @@ describe("compact tool", () => {
 			const state = setup({ hasUI });
 			await state.tool.execute("call", {}, undefined, undefined, state.ctx);
 			state.getCompactOptions()?.onError(new Error("boom"));
+			state.getCompactOptions()?.onError(new Error("duplicate"));
 			state.getCompactOptions()?.onComplete();
 			await flushMicrotasks();
 			assert.deepEqual(state.sent, []);

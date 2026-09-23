@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { catalogContent, notificationContent, spawnContent } from "../index.ts";
+import {
+	catalogContent,
+	idleResult,
+	notificationContent,
+	spawnContent,
+} from "../index.ts";
 
-test("idle notification explains how to retrieve full agent output", () => {
+test("idle notification explains that truncated child output is not retrievable", () => {
 	const content = notificationContent({
 		eventId: 7,
 		agentId: "ag_1",
@@ -29,9 +34,10 @@ test("idle notification explains how to retrieve full agent output", () => {
 	});
 	assert.match(content, /Agent group idle_1 has resolved/);
 	assert.match(content, /ag_1 completed: review complete/);
-	assert.match(content, /action inspect/);
-	assert.match(content, /includeOutput true/);
-	assert.match(content, /remaining output/);
+	assert.match(content, /final result excerpts above are bounded/i);
+	assert.match(content, /intentionally unavailable/);
+	assert.match(content, /concise restatement/);
+	assert.doesNotMatch(content, /includeOutput|remaining output/);
 });
 
 test("complete idle notification omits unnecessary inspect guidance", () => {
@@ -91,7 +97,7 @@ test("individual terminal notification uses resolved wording", () => {
 	assert.match(content, /cost unknown/);
 });
 
-test("truncated individual completion explains how to retrieve remaining output", () => {
+test("truncated individual completion does not offer full output retrieval", () => {
 	const content = notificationContent({
 		eventId: 9,
 		agentId: "ag_4",
@@ -102,8 +108,10 @@ test("truncated individual completion explains how to retrieve remaining output"
 			outputTruncated: true,
 		},
 	});
-	assert.match(content, /action inspect/);
-	assert.match(content, /remaining output/);
+	assert.match(content, /final result excerpt above was truncated/i);
+	assert.match(content, /intentionally unavailable/);
+	assert.match(content, /resume agent ag_4/);
+	assert.doesNotMatch(content, /includeOutput|remaining output/);
 });
 
 test("spawn output makes a known provider block and recovery action explicit", () => {
@@ -128,7 +136,7 @@ test("spawn output makes a known provider block and recovery action explicit", (
 	assert.equal((content.match(/Do not spawn duplicates/g) ?? []).length, 1);
 });
 
-test("spawn output directs the parent to idle instead of polling or stopping", () => {
+test("spawn output explains automatic completion without requiring idle", () => {
 	const content = spawnContent({
 		agentId: "ag_1",
 		runId: "run_1",
@@ -141,10 +149,35 @@ test("spawn output directs the parent to idle instead of polling or stopping", (
 		},
 	});
 	assert.match(content, /without polling/);
-	assert.match(content, /action idle/);
-	assert.match(content, /then end your turn/);
+	assert.match(content, /resume this parent/);
+	assert.match(content, /idle only to join/);
+	assert.doesNotMatch(content, /call agent with action idle/);
 	assert.match(content, /stop only to cancel/);
 	assert.match(content, /Runtime limit: 3600 seconds/);
+});
+
+test("an armed idle join terminates while immediate resolution continues", () => {
+	const agent = {
+		agentId: "ag_1",
+		state: "running",
+		summary: "still running",
+	};
+	const armed = idleResult({
+		idleId: "idle_1",
+		state: "armed",
+		agents: [agent],
+	});
+	assert.equal(armed.terminate, true);
+	assert.match(armed.content[0]?.text ?? "", /run will settle now/);
+
+	const resolved = idleResult({
+		idleId: "idle_2",
+		state: "resolved",
+		resolution: "all_settled",
+		agents: [{ ...agent, state: "completed", summary: "done" }],
+	});
+	assert.equal("terminate" in resolved, false);
+	assert.match(resolved.content[0]?.text ?? "", /resolved immediately/);
 });
 
 test("catalog output reports known scheduler admission blocks", () => {

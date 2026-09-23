@@ -70,7 +70,6 @@ test("idle accepts a bounded unique agent set", () => {
 	validateAction({
 		action: "inspect_many",
 		agentIds: ["ag_1", "ag_2"],
-		includeOutput: true,
 	});
 	validateAction({
 		action: "idle_update",
@@ -91,6 +90,27 @@ test("idle accepts a bounded unique agent set", () => {
 	assert.throws(
 		() => validateAction({ action: "idle_update", idleId: "idle_1" }),
 		/requires/,
+	);
+});
+
+test("inspect actions reject child-output retrieval fields", () => {
+	assert.throws(
+		() =>
+			validateAction({
+				action: "inspect",
+				agentId: "ag_1",
+				includeOutput: true,
+			}),
+		ContractError,
+	);
+	assert.throws(
+		() =>
+			validateAction({
+				action: "inspect_many",
+				agentIds: ["ag_1"],
+				includeOutput: true,
+			}),
+		ContractError,
 	);
 });
 

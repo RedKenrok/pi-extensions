@@ -54,7 +54,7 @@ Supervisor state lives outside the repository under the Pi agent directory. Loos
 
 Each worker generation has a fencing token. The supervisor accepts events only from the current generation and launches no replacement until the previous local worker is known dead; an expired lease alone is insufficient. Idempotency is scoped to the parent session and tool call, with `requestId` available for retries across turns.
 
-Full results live in bounded, rotated artifacts with restrictive permissions. Supervisor records exclude credentials, authorization headers, and raw provider error bodies.
+Full results live in bounded, rotated internal artifacts with restrictive permissions. Parent-facing inspect actions expose neither those artifacts nor child transcript paths. Supervisor records exclude credentials, authorization headers, and raw provider error bodies.
 
 ## Worker lifecycle and controls
 
@@ -107,7 +107,7 @@ At startup, the supervisor fences stale generations, preserves queued and paused
 
 The supervisor cannot atomically commit filesystem or remote effects. Workers record tool start before dispatch and completion after observing output as a best-effort aid to recovery. If a crash occurs between an effect and its result, recovery inspects the affected resource or uses a tool-specific idempotency key. Read-only operations can usually repeat; writes and external submissions require evidence. Unknown outcomes remain `recovery_required` until an explicit retry or skip decision is recorded.
 
-Recovery does not fabricate tool results or manually reconstruct incomplete provider messages. Original transcripts and artifacts remain available for inspection.
+Recovery does not fabricate tool results or manually reconstruct incomplete provider messages. Original transcripts and artifacts remain available internally for child-session recovery, but are not exposed through parent inspect actions.
 
 ## Workspace boundary
 

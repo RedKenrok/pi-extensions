@@ -116,7 +116,7 @@ export function spawnContent(details: SpawnDetails): string {
 	if (details.state === "blocked") {
 		return `Accepted agent ${details.agentId} (${details.runId}) as blocked: ${details.admission?.message ?? details.error?.message ?? details.reason ?? "provider unavailable"} Model ${model}, reasoning ${details.effective.reasoning}, workspace ${details.effective.cwd}.${runtime}`;
 	}
-	return `Accepted ${details.agentId} (${details.runId}) in ${details.state}. Continue independent work without polling; completion will be delivered automatically. When no independent work remains and you need this result, call agent with action idle for this agent, then end your turn. Use stop only to cancel unwanted work. Model ${model}, reasoning ${details.effective.reasoning}, workspace ${details.effective.cwd}.${runtime}`;
+	return `Accepted ${details.agentId} (${details.runId}) in ${details.state}. Continue independent work or end your turn without polling; completion will be delivered automatically and resume this parent when it is idle. Use idle only to join a specific group under a completion condition, and use stop only to cancel unwanted work. Model ${model}, reasoning ${details.effective.reasoning}, workspace ${details.effective.cwd}.${runtime}`;
 }
 
 export function catalogContent(details: CatalogDetails): string {
@@ -158,7 +158,7 @@ export function notificationContent(notification: Notification): string {
 			)
 			.join("\n");
 		const inspect = payload.agents.some((agent) => agent.outputTruncated)
-			? "\n\nOne or more result excerpts were truncated. Call agent with action inspect, the desired agentId, and includeOutput true to retrieve remaining output."
+			? "\n\nThe final result excerpts above are bounded, and one or more were truncated. Full child output and transcripts are intentionally unavailable to the parent. If necessary, resume a completed agent and ask it for a concise restatement."
 			: "";
 		return `Agent group ${payload.idleId} has resolved (${payload.resolution ?? "all_settled"}).\n${agents}${inspect}`;
 	}
@@ -167,11 +167,30 @@ export function notificationContent(notification: Notification): string {
 		? "has resolved"
 		: "requires attention";
 	const usage = usageLine(payload.usage);
-	const inspect =
-		status !== "completed" || payload.outputTruncated
-			? `\n\nCall agent with action inspect, agentId ${notification.agentId}, and includeOutput true to retrieve ${payload.outputTruncated ? "the remaining output" : "full diagnostics"}.`
+	const inspect = payload.outputTruncated
+		? `\n\nThe final result excerpt above was truncated at the bounded delivery limit. Full child output and transcripts are intentionally unavailable to the parent. If necessary, resume agent ${notification.agentId} and ask it for a concise restatement.`
+		: status !== "completed"
+			? `\n\nInspect agent ${notification.agentId} for state and diagnostics.`
 			: "";
 	return `Agent ${notification.agentId} ${disposition} as ${status}: ${payload.summary ?? "Inspect the agent for details."}${usage ? `\nRun usage: ${usage}` : ""}${inspect}`;
+}
+
+export function idleResult(details: {
+	idleId: string;
+	state: "armed" | "resolved";
+	resolution?: string;
+	agents: ResolvedAgent[];
+}) {
+	const inspect = details.agents.some((agent) => agent.outputTruncated)
+		? " One or more final result excerpts were truncated at the bounded delivery limit; full child output and transcripts are intentionally unavailable to the parent. Resume a completed agent and request a concise restatement if needed."
+		: "";
+	return result(
+		details.state === "armed"
+			? `Idle barrier ${details.idleId} is armed for ${details.agents.map((agent) => agent.agentId).join(", ")}. This parent run will settle now and resume automatically when the group resolves.`
+			: `Idle barrier ${details.idleId} resolved immediately (${details.resolution}). ${details.agents.map((agent) => `${agent.agentId}:${agent.state} (${agent.summary})`).join(", ")}.${inspect}`,
+		details,
+		details.state === "armed",
+	);
 }
 
 export default function piTools(pi: ExtensionAPI) {
@@ -399,14 +418,16 @@ export default function piTools(pi: ExtensionAPI) {
 		description: "Run and manage background agents.",
 		promptSnippet: "Run or manage background agents",
 		promptGuidelines: [
-			"Agent spawn returns immediately. Continue independent work without polling; completion notifications arrive automatically.",
+			"Agent spawn returns immediately. Continue independent work or end the parent turn without polling; completion notifications automatically resume the parent when it is idle.",
 			"Before the first spawn in a session, call agent catalog at least once. It lists the user's session-scoped models, or all authenticated models when no scope is configured.",
 			"Agent spawn requires an exact catalog model {provider, id}; models are not inherited. Use only a reasoning effort listed for that model.",
 			"Agents have a one-hour wall-clock runtime by default. The only spawn limit is limits.runtimeSeconds, specified as a positive integer number of seconds; there are no turn or token limits.",
 			"If catalog returns nextCursor and the desired model is not shown, call catalog again with that cursor before spawning.",
 			"By default, spawned agents receive only the parent's active read, grep, find, and ls tools; pass tools explicitly when more access is required.",
-			"Check catalog admission before spawning. If blocked, do not duplicate that provider scope; resume one agent when available.",
-			"When your next step depends on agents and no independent work remains, call agent with action idle and their agentIds, then end the turn immediately. The harness will resume you when the condition resolves; do not poll or merely say you are waiting.",
+			"Check catalog admission before spawning. If blocked, do not duplicate that provider scope; resume one existing blocked agent when availability returns.",
+			"After the parent resumes from a quota interruption, call list once. Child processes exit but quota-affected agents normally remain blocked with saved conversations: resume one existing blocked agent per provider scope, and a successful probe releases siblings configured for when_available recovery. Agents whose state is literally stopped are terminal and must be replaced.",
+			"Do not call agent idle for ordinary completion delivery. Use idle only as the final action when joining a specific group under all-settled, first-result, quorum, fail-fast, or failure-watch semantics.",
+			"An armed idle call coalesces matching notifications and requests that the parent run settle; the harness resumes it when the condition resolves.",
 			"Agent idle policies: any_settled=first result, quorum=enough, all_succeeded=fail-fast success, first_failure=failure watch.",
 			"Agent disconnectPolicy continue_headless permits one tool-free continuation after clean application exit; defer waits for this session.",
 			"Use agent wait only for one brief in-turn check while other work remains; never loop on wait.",
@@ -438,7 +459,7 @@ export default function piTools(pi: ExtensionAPI) {
 						);
 					case "inspect":
 						return result(
-							`${agentStateLine(details.agent)}.${usageLine(details.usage) ? ` Run usage: ${usageLine(details.usage)}.` : ""}${usageLine(details.usage, true) ? ` Lifetime usage: ${usageLine(details.usage, true)} across ${details.usage.lifetime.runs} run(s).` : ""}${details.diagnostics?.cooldown ? ` Provider cooldown: ${details.diagnostics.cooldown.kind}, ${details.diagnostics.cooldown.attempts} probe(s)${details.diagnostics.cooldown.notBefore ? `, not before ${details.diagnostics.cooldown.notBefore}` : ""}.` : ""}${details.output ? `\n\n${details.output}${details.outputTruncated ? "\n[output truncated; continue with cursor]" : ""}` : ""}`,
+							`${agentStateLine(details.agent)}.${usageLine(details.usage) ? ` Run usage: ${usageLine(details.usage)}.` : ""}${usageLine(details.usage, true) ? ` Lifetime usage: ${usageLine(details.usage, true)} across ${details.usage.lifetime.runs} run(s).` : ""}${details.diagnostics?.cooldown ? ` Provider cooldown: ${details.diagnostics.cooldown.kind}, ${details.diagnostics.cooldown.attempts} probe(s)${details.diagnostics.cooldown.notBefore ? `, not before ${details.diagnostics.cooldown.notBefore}` : ""}.` : ""}`,
 							details,
 						);
 					case "inspect_many":
@@ -446,7 +467,7 @@ export default function piTools(pi: ExtensionAPI) {
 							details.agents
 								.map(
 									(value: any) =>
-										`${agentStateLine(value.agent)}${usageLine(value.usage) ? ` · ${usageLine(value.usage)}` : ""}${value.output ? `\n${value.output}` : ""}`,
+										`${agentStateLine(value.agent)}${usageLine(value.usage) ? ` · ${usageLine(value.usage)}` : ""}`,
 								)
 								.join("\n\n"),
 							details,
@@ -456,7 +477,7 @@ export default function piTools(pi: ExtensionAPI) {
 							(agent: AgentStateDetails) =>
 								!["completed", "failed", "stopped"].includes(agent.state),
 						)
-							? " Do not poll again: continue independent work, or call idle and end your turn if you now depend on these agents."
+							? " Do not poll again: continue independent work or end your turn; completion will resume this parent automatically. Use idle only to join a group under a completion condition."
 							: "";
 						return result(
 							`${
@@ -467,19 +488,8 @@ export default function piTools(pi: ExtensionAPI) {
 							details,
 						);
 					}
-					case "idle": {
-						const inspect = details.agents.some(
-							(agent: any) => agent.outputTruncated,
-						)
-							? " One or more result excerpts were truncated; inspect those agents with includeOutput true for remaining output."
-							: "";
-						return result(
-							details.state === "armed"
-								? `Idle barrier ${details.idleId} is armed for ${details.agents.map((agent: any) => agent.agentId).join(", ")}. End this turn now; The harness will continue automatically when the group resolves.`
-								: `Idle barrier ${details.idleId} resolved immediately (${details.resolution}). ${details.agents.map((agent: any) => `${agent.agentId}:${agent.state} (${agent.summary})`).join(", ")}.${inspect}`,
-							details,
-						);
-					}
+					case "idle":
+						return idleResult(details);
 					case "idle_list":
 						return result(
 							details.idles.length
@@ -588,7 +598,7 @@ export default function piTools(pi: ExtensionAPI) {
 				if (!agentId) throw new Error(`Usage: /agents ${command} <agent-id>`);
 				const action: AgentAction =
 					command === "inspect"
-						? { action: "inspect", agentId, includeOutput: true }
+						? { action: "inspect", agentId }
 						: command === "idle"
 							? { action: "idle_inspect", idleId: agentId }
 							: command === "cancel-idle"

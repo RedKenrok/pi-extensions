@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fauxProvider } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { stableHash } from "../src/ids.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import type { Clock } from "../src/types.ts";
@@ -38,25 +38,28 @@ function fixture() {
 	return { supervisor, clock };
 }
 
-async function fauxRuntime(
-	dir: string,
+function fauxRuntime(
+	_dir: string,
 	providerNames = ["pi-tools-test"],
 	modelIds = ["test"],
-): Promise<ModelRuntime> {
-	const runtime = await ModelRuntime.create({
-		authPath: join(dir, "auth.json"),
-		modelsPath: null,
-		modelsStorePath: join(dir, "models-store.json"),
-		refreshOnCreate: false,
-	});
-	for (const providerName of providerNames) {
-		const provider = fauxProvider({
-			provider: providerName,
-			models: modelIds.map((id) => ({ id, reasoning: false })),
-		});
-		runtime.registerNativeProvider(provider.provider);
-	}
-	return runtime;
+): ModelRuntime {
+	const models = providerNames.flatMap(
+		(provider) =>
+			fauxProvider({
+				provider,
+				models: modelIds.map((id) => ({ id, reasoning: false })),
+			}).models,
+	);
+	return {
+		getModel: (provider: string, id: string) =>
+			models.find((model) => model.provider === provider && model.id === id),
+		getAvailable: (provider?: string) =>
+			Promise.resolve(
+				provider
+					? models.filter((model) => model.provider === provider)
+					: models,
+			),
+	} as unknown as ModelRuntime;
 }
 
 test("duplicate durable messages are idempotent and payload reuse conflicts", async () => {
@@ -925,22 +928,28 @@ test("worker output, summaries, and failures are redacted at the supervisor boun
 	}
 });
 
-test("inspect paginates rotated output before the current artifact", async () => {
+test("inspect does not expose child transcripts or accumulated output artifacts", async () => {
 	const { supervisor } = fixture();
 	const dir = mkdtempSync(join(tmpdir(), "pi-tools-output-"));
-	const path = join(dir, "agent.log");
-	writeFileSync(`${path}.2`, "oldest\n");
-	writeFileSync(`${path}.1`, "older\n");
-	writeFileSync(path, "current\n");
+	const resultPath = join(dir, "agent.log");
+	const sessionFile = join(dir, "child.jsonl");
+	writeFileSync(resultPath, "private accumulated output\n");
+	writeFileSync(sessionFile, "private transcript\n");
 	supervisor.store.insertAgent(
-		agent({ state: "completed", resultPath: path }),
+		agent({ state: "completed", resultPath, sessionFile }),
 		"task",
 	);
 	const inspection = (await supervisor.handle(
-		request({ action: "inspect", agentId: "ag_test", includeOutput: true }),
+		request({ action: "inspect", agentId: "ag_test" }),
 	)) as any;
-	assert.equal(inspection.output, "oldest\nolder\ncurrent\n");
-	assert.equal(inspection.outputTruncated, false);
+	assert.equal(inspection.output, undefined);
+	assert.equal(inspection.nextCursor, undefined);
+	assert.equal(inspection.session.file, undefined);
+	assert.equal(inspection.diagnostics.resultPath, undefined);
+	assert.doesNotMatch(
+		JSON.stringify(inspection),
+		/private accumulated output|private transcript/,
+	);
 	supervisor.stop();
 });
 
@@ -1262,35 +1271,28 @@ test("idle barriers can be listed, inspected, updated, cancelled, and changed by
 	supervisor.stop();
 });
 
-test("inspect_many caps aggregate output at 64 KiB", async () => {
+test("inspect_many exposes diagnostics but no child output", async () => {
 	const { supervisor } = fixture();
-	const ids: string[] = [];
-	for (let index = 0; index < 5; index++) {
-		const agentId = `ag_many_${index}`;
-		const path = join(tmpdir(), `${agentId}-${Date.now()}.log`);
-		writeFileSync(path, "x".repeat(20 * 1024));
-		ids.push(agentId);
+	const ids = ["ag_many_1", "ag_many_2"];
+	for (const [index, agentId] of ids.entries())
 		supervisor.store.insertAgent(
 			agent({
 				agentId,
 				currentRunId: `run_many_${index}`,
 				state: "completed",
-				resultPath: path,
 			}),
 			"task",
 		);
-	}
 	const value = (await supervisor.handle(
-		request({ action: "inspect_many", agentIds: ids, includeOutput: true }),
+		request({ action: "inspect_many", agentIds: ids }),
 	)) as any;
-	assert.ok(
-		value.agents.reduce(
-			(sum: number, item: any) => sum + Buffer.byteLength(item.output ?? ""),
-			0,
-		) <=
-			64 * 1024,
+	assert.equal(value.agents.length, 2);
+	assert.equal(
+		value.agents.some((item: any) => "output" in item),
+		false,
 	);
-	assert.equal(value.truncated, true);
+	assert.equal("outputLimitBytes" in value, false);
+	assert.equal("truncated" in value, false);
 	supervisor.stop();
 });
 
@@ -1316,7 +1318,9 @@ test("continue_headless launches once after a quit and persists fenced completio
 			return { pid: process.pid };
 		},
 	});
-	supervisor.store.insertAgent(agent({ state: "running" }), "task");
+	const resultPath = join(dir, "accumulated.log");
+	writeFileSync(resultPath, "private prior child output");
+	supervisor.store.insertAgent(agent({ state: "running", resultPath }), "task");
 	const armed = (await supervisor.handle(
 		request(
 			{
@@ -1342,6 +1346,8 @@ test("continue_headless launches once after a quit and persists fenced completio
 	const config = JSON.parse(readFileSync(launches[0]!, "utf8"));
 	assert.equal(config.idleId, armed.idleId);
 	assert.match(config.prompt, /Agent ag_test/);
+	assert.match(config.prompt, /Final result excerpt: result/);
+	assert.doesNotMatch(config.prompt, /private prior child output/);
 	supervisor.headlessEvent({
 		idleId: armed.idleId,
 		headlessRunId: config.headlessRunId,

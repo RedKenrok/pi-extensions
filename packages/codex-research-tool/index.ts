@@ -4,7 +4,7 @@ import {
 	readStoredCredential,
 	VERSION,
 } from "@earendil-works/pi-coding-agent";
-import { AuthAdapter, unsupportedPiResult } from "./src/auth.ts";
+import { AuthAdapter } from "./src/auth.ts";
 import {
 	CODEX_CLIENT_VERSION,
 	CodexClient,
@@ -17,13 +17,6 @@ type Availability =
 	| { kind: "unchecked" }
 	| { kind: "ready" }
 	| { kind: "unavailable"; message: string };
-
-function supportsPi(version: string): boolean {
-	const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
-	if (!match) return false;
-	const [, major, minor, patch = 0] = match.map(Number);
-	return major === 0 && minor === 85 && patch >= 1;
-}
 
 function removeResearch(pi: ExtensionAPI): void {
 	const active = pi.getActiveTools();
@@ -201,12 +194,10 @@ export function createResearchExtension(
 			});
 			if (runtimeController.signal.aborted) onRuntimeAbort();
 			try {
-				const result = supportsPi(piVersion)
-					? await auth.check({
-							signal: availabilityController.signal,
-							timeoutMs: 5_000,
-						})
-					: unsupportedPiResult();
+				const result = await auth.check({
+					signal: availabilityController.signal,
+					timeoutMs: 5_000,
+				});
 				if (checkGeneration !== generation || runtimeController.signal.aborted)
 					return;
 				if (result.kind === "ready") {
@@ -288,4 +279,3 @@ export function createResearchExtension(
 }
 
 export default createResearchExtension();
-export { supportsPi };

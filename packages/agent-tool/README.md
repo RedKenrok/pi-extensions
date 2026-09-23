@@ -58,9 +58,9 @@ The `agent` tool uses an `action` discriminator:
 | `catalog` | List authenticated models, supported reasoning levels, profiles, and known scheduler admission blocks. |
 | `spawn` | Commit a new child and return its identifiers immediately. |
 | `list` | List children, optionally filtered by state. |
-| `inspect`, `inspect_many` | Read current state, events, summaries, and optional output. |
+| `inspect`, `inspect_many` | Read current state, events, summaries, and diagnostics without exposing child transcripts or accumulated output. |
 | `wait` | Observe up to eight children synchronously for at most 60 seconds. |
-| `idle` | Arm a completion condition that can continue the parent later. |
+| `idle` | Join a specific child group under a completion condition and coalesce its notifications. |
 | `idle_list`, `idle_inspect`, `idle_update`, `idle_cancel` | Manage idle conditions. |
 | `message` | Steer an active child or queue a follow-up. |
 | `pause`, `resume`, `stop` | Control child execution and recovery. |
@@ -89,14 +89,16 @@ Start a background child:
 
 The response includes `agentId` and per-attempt `runId` values plus requested and effective configuration. `spawn` does not wait for the child model. `model` is required and must use the exact `{ "provider": "…", "id": "…" }` returned by `catalog`; spawn never silently inherits the parent model. Each run has a one-hour wall-clock limit by default. Override it with `limits: { "runtimeSeconds": 7200 }`; the value is a positive integer number of seconds. Spawn has no turn-count or token-count limit.
 
-**Waiting workflow:** continue independent work after `spawn`; do not poll for completion. If an agent result becomes the only remaining blocker, call `idle` with its `agentId` and end the parent turn immediately. Pi will resume the parent automatically when the condition resolves. `wait` is only for one brief synchronous observation while other parent work remains. `stop` cancels work whose result is no longer wanted; it is not a way to wait, and an in-flight operation may finish before cancellation settles.
+**Completion workflow:** continue independent work after `spawn`, or simply end the parent turn; do not poll for completion. Ordinary child completion is delivered automatically and starts a new parent turn once the parent is idle, so a single child does not require an `idle` call. Use `idle` only when a specific group should be joined under an aggregate condition such as all-settled, quorum, or fail-fast. `wait` is only for one brief synchronous observation while other parent work remains. `stop` cancels work whose result is no longer wanted; it is not a way to wait, and an in-flight operation may finish before cancellation settles.
 
 If a provider scope already has a known cooldown, a child is committed directly as `blocked` rather than being reported as temporarily queued. Its response includes the reason, normalized error, and admission guidance. Once the scope requires manual retry, further spawns in that parent and scope are rejected by default; set `blockedPolicy` to `enqueue` only to deliberately add waiting work. Resume assigns one shared probe owner while the supervisor is running. Concurrent resumes still save their requested model and run configuration, but remain blocked behind that owner until its successful probe releases them.
+
+After the parent itself returns from a quota interruption, it should call `list` once and reuse the existing agent IDs. The child worker processes will have exited, but quota-affected agents normally remain in `blocked`, retaining their saved conversations. Resume one blocked agent per provider scope; when that probe succeeds, siblings using the default `when_available` recovery policy are released automatically. An agent whose state is literally `stopped` was cancelled and is terminal, so it cannot be resumed; spawn a replacement only in that case. Agents configured with `recovery: "manual"` must each be resumed explicitly.
 
 Inspect, idle, wait, steer, and control it:
 
 ```json
-{"action":"inspect","agentId":"ag_…","includeOutput":true}
+{"action":"inspect","agentId":"ag_…"}
 {"action":"idle","agentIds":["ag_…","ag_…"],"until":"all_settled","requestId":"review-group"}
 {"action":"wait","agentIds":["ag_…"],"afterEventId":41,"timeoutMs":60000}
 {"action":"message","agentId":"ag_…","delivery":"steer","text":"Focus on the token refresh race.","requestId":"focus-1"}
@@ -106,7 +108,7 @@ Inspect, idle, wait, steer, and control it:
 {"action":"stop","agentId":"ag_…","reason":"No longer needed"}
 ```
 
-`idle` is the nonblocking option for a parent whose next step depends on a defined set of one to eight children. It supports `all_settled`, `any_settled`, `all_succeeded`, `first_failure`, and `quorum` conditions; `all_settled` is the default. The call commits the condition and returns immediately. After the tool confirms that it is armed, the model ends its turn. Matching child notifications are coalesced, and Pi injects one aggregate message when the condition resolves. A paused or nonrecoverably blocked member can resolve the condition with `attention_required`; recoverable quota waits remain armed.
+`idle` is the advanced join option for a parent that wants one aggregate result from a defined set of one to eight children. It is not required for ordinary completion delivery. It supports `all_settled`, `any_settled`, `all_succeeded`, `first_failure`, and `quorum` conditions; `all_settled` is the default. The call commits the condition and returns immediately. An armed result requests early termination of the parent tool batch, so a standalone `idle` call settles the run without another model response merely acknowledging the wait. Matching child notifications are coalesced, and Pi injects one aggregate message when the condition resolves. A paused or nonrecoverably blocked member can resolve the condition with `attention_required`; recoverable quota waits remain armed.
 
 `activityPolicy` controls what happens if the parent becomes active while the condition is pending: keep it, cancel it, or retain notification without automatic wakeup. `disconnectPolicy` either defers delivery until the exact parent session reconnects or permits a headless continuation. Pending conditions can be listed, inspected, updated, or cancelled by their saved `idleId`.
 
@@ -118,18 +120,18 @@ Examples of the extended controls:
 {"action":"idle_inspect","idleId":"idle_…"}
 {"action":"idle_update","idleId":"idle_…","removeAgentIds":["ag_3"],"addAgentIds":["ag_4"],"requestId":"swap-reviewer"}
 {"action":"idle_cancel","idleId":"idle_…","requestId":"no-longer-needed"}
-{"action":"inspect_many","agentIds":["ag_1","ag_2"],"includeOutput":true}
+{"action":"inspect_many","agentIds":["ag_1","ag_2"]}
 ```
 
-The completion conditions are: `any_settled` for the first terminal member, `quorum` after the requested number settle, `all_succeeded` for fail-fast all-success, and `first_failure` for failure monitoring (or `all_succeeded` when every member completes). `inspect_many` applies a 64 KiB aggregate output ceiling in addition to per-agent pagination.
+The completion conditions are: `any_settled` for the first terminal member, `quorum` after the requested number settle, `all_succeeded` for fail-fast all-success, and `first_failure` for failure monitoring (or `all_succeeded` when every member completes).
 
-The aggregate message contains bounded summaries. It recommends `{"action":"inspect","agentId":"ag_…","includeOutput":true}` only when an included result excerpt was truncated. If every requested agent is already settled, `idle` resolves immediately and does not schedule a redundant continuation. `requestId` makes retries idempotent.
+The aggregate message contains bounded final-result excerpts. If an excerpt is truncated, the parent is told that full child output and transcripts are intentionally unavailable. It can resume a completed child and request a concise restatement instead of importing that child's accumulated context. If every requested agent is already settled, `idle` resolves immediately and does not schedule a redundant continuation. `requestId` makes retries idempotent.
 
 `wait` remains the short synchronous observation primitive. It observes at most eight agents, subscribes before checking the cursor, returns on any event, and times out after at most 60 seconds without cancelling a child. Ordinary completion, failure, quota blocks, and reconciliation blocks outside an idle barrier are delivered automatically to the owning parent session.
 
 Notifications use Pi follow-up delivery and trigger a new LLM turn when the parent is idle. While a parent run is active, notifications remain in the supervisor outbox so an `idle` barrier can coalesce them before they enter Pi's follow-up queue. Pi exposes no extension API for retracting a follow-up after it has been queued. If the parent session is disconnected, notifications stay in the outbox and are replayed after it reattaches.
 
-`disconnectPolicy: "continue_headless"` is an explicit exception for a clean Pi quit. When its barrier later resolves, the supervisor claims one continuation, reopens the exact saved parent session, and appends one tool-free model turn containing bounded child summaries and result excerpts. Its run ID and process ID are persisted so supervisor recovery does not duplicate a live continuation. Missing session/model/cwd state fails visibly on the barrier. The default `defer` policy makes no unattended model call. Reload, fork, session replacement, and an unclean parent crash also defer rather than risk concurrent writes; a headless run already claimed before reattachment is allowed to finish.
+`disconnectPolicy: "continue_headless"` is an explicit exception for a clean Pi quit. When its barrier later resolves, the supervisor claims one continuation, reopens the exact saved parent session, and appends one tool-free model turn containing only bounded final-result excerpts, never accumulated child output or transcripts. Its run ID and process ID are persisted so supervisor recovery does not duplicate a live continuation. Missing session/model/cwd state fails visibly on the barrier. The default `defer` policy makes no unattended model call. Reload, fork, session replacement, and an unclean parent crash also defer rather than risk concurrent writes; a headless run already claimed before reattachment is allowed to finish.
 
 ## Configuration and behavior
 
@@ -222,7 +224,7 @@ These commands do not require a model request:
 /agents stop-all
 ```
 
-Status distinguishes running, gracefully pausing, paused by the user, waiting for quota, and blocked for reconciliation. Inspect additionally shows the run and fencing generation, desired state, model/reasoning, workspace base revision, cooldown provenance, pending controls, and uncertain operations. Partial output is labeled by state and is not represented as a final answer.
+Status distinguishes running, gracefully pausing, paused by the user, waiting for quota, and blocked for reconciliation. Inspect additionally shows the run and fencing generation, desired state, model/reasoning, workspace base revision, cooldown provenance, pending controls, and uncertain operations. It does not expose the child transcript, transcript path, accumulated output artifact, or artifact path.
 
 ### Best-effort state and recovery
 
@@ -283,7 +285,7 @@ npm run check
 npm run compat
 ```
 
-The automated suite covers versioned JSON reopen and reset, idempotent controls and resumes, every idle completion policy, barrier list/inspect/update/cancel, parent-activity policies, aggregate wakeups, bounded multi-inspection, exact extension forwarding for background research, headless continuation, immediate settlement, nonrecoverable attention, notification retrieval guidance, late-event fencing, stale-worker lease termination, shared cooldown single-probe behavior, explicit manual recovery, known multi-hour reset plus restart/sleep, bounded unknown-reset backoff, ownership isolation, outbox replay, wait races, uncertain-side-effect decisions, worktree provenance, missing workspaces, queue saturation, malformed state, literal transport, and secret redaction. The Unix-socket process handshake test skips only when the execution sandbox itself denies local socket listeners.
+The automated suite covers versioned JSON reopen and reset, idempotent controls and resumes, every idle completion policy, barrier list/inspect/update/cancel, parent-activity policies, aggregate wakeups, bounded multi-inspection, exact extension forwarding for background research, headless continuation, immediate settlement, nonrecoverable attention, notification truncation guidance, late-event fencing, stale-worker lease termination, shared cooldown single-probe behavior, explicit manual recovery, known multi-hour reset plus restart/sleep, bounded unknown-reset backoff, ownership isolation, outbox replay, wait races, uncertain-side-effect decisions, worktree provenance, missing workspaces, queue saturation, malformed state, literal transport, and secret redaction. The Unix-socket process handshake test skips only when the execution sandbox itself denies local socket listeners.
 
 The compatibility spike uses Pi's faux provider and makes no billable request. It checks the pinned SDK assumptions for exact session reopen, literal prompts, model-derived reasoning levels, selected extension-tool execution, recursive `agent` exclusion, controlled resource loading, pre-dispatch tool blocking, and abort settlement. The resulting design constraints are documented in [Architecture](docs/architecture.md).
 

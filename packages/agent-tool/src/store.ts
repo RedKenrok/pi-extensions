@@ -179,7 +179,7 @@ function envelope<T>(kind: string, data: T): Envelope<T> {
 function writeJson(path: string, value: unknown): void {
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const temporary = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
-	writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+	writeFileSync(temporary, `${JSON.stringify(value)}\n`, {
 		encoding: "utf8",
 		mode: 0o600,
 	});
@@ -246,6 +246,9 @@ export class Store {
 	private global = emptyGlobal();
 	private transactionDepth = 0;
 	private dirty = false;
+	private globalDirty = false;
+	private readonly dirtyAgents = new Set<string>();
+	private readonly dirtyIdles = new Set<string>();
 
 	constructor(path: string) {
 		this.path = path;
@@ -268,6 +271,10 @@ export class Store {
 						global: this.global,
 						agents: [...this.agents],
 						idles: [...this.idles],
+						dirty: this.dirty,
+						globalDirty: this.globalDirty,
+						dirtyAgents: [...this.dirtyAgents],
+						dirtyIdles: [...this.dirtyIdles],
 					})
 				: undefined;
 		this.transactionDepth++;
@@ -284,7 +291,12 @@ export class Store {
 				for (const [key, value] of snapshot.agents) this.agents.set(key, value);
 				this.idles.clear();
 				for (const [key, value] of snapshot.idles) this.idles.set(key, value);
-				this.dirty = false;
+				this.dirty = snapshot.dirty;
+				this.globalDirty = snapshot.globalDirty;
+				this.dirtyAgents.clear();
+				for (const id of snapshot.dirtyAgents) this.dirtyAgents.add(id);
+				this.dirtyIdles.clear();
+				for (const id of snapshot.dirtyIdles) this.dirtyIdles.add(id);
 			}
 			throw error;
 		}
@@ -323,21 +335,48 @@ export class Store {
 			}
 		}
 	}
-	private changed(): void {
+	private changed(target: "global" | "agent" | "idle", id?: string): void {
 		this.dirty = true;
+		if (target === "global") {
+			this.globalDirty = true;
+			if (id) this.dirtyAgents.add(id);
+		} else if (target === "agent" && id) this.dirtyAgents.add(id);
+		else if (target === "idle" && id) this.dirtyIdles.add(id);
 		if (this.transactionDepth === 0) this.flush();
 	}
 	private flush(): void {
-		writeJson(join(this.path, "global.json"), envelope("global", this.global));
-		const agentDir = join(this.path, "agents");
-		const idleDir = join(this.path, "idles");
-		mkdirSync(agentDir, { recursive: true, mode: 0o700 });
-		mkdirSync(idleDir, { recursive: true, mode: 0o700 });
-		for (const [id, value] of this.agents)
-			writeJson(join(agentDir, `${id}.json`), envelope("agent", value));
-		for (const [id, value] of this.idles)
-			writeJson(join(idleDir, `${id}.json`), envelope("idle", value));
+		if (this.globalDirty)
+			writeJson(
+				join(this.path, "global.json"),
+				envelope("global", {
+					...this.global,
+					toolOperations: this.global.toolOperations.filter(
+						(operation) => operation.state === "started",
+					),
+				}),
+			);
+		if (this.dirtyAgents.size) {
+			const agentDir = join(this.path, "agents");
+			mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+			for (const id of this.dirtyAgents) {
+				const value = this.agents.get(id);
+				if (value)
+					writeJson(join(agentDir, `${id}.json`), envelope("agent", value));
+			}
+		}
+		if (this.dirtyIdles.size) {
+			const idleDir = join(this.path, "idles");
+			mkdirSync(idleDir, { recursive: true, mode: 0o700 });
+			for (const id of this.dirtyIdles) {
+				const value = this.idles.get(id);
+				if (value)
+					writeJson(join(idleDir, `${id}.json`), envelope("idle", value));
+			}
+		}
 		this.dirty = false;
+		this.globalDirty = false;
+		this.dirtyAgents.clear();
+		this.dirtyIdles.clear();
 	}
 
 	insertAgent(agent: AgentRecord, prompt: string): void {
@@ -352,7 +391,7 @@ export class Store {
 			state: agent.state,
 			createdAt: agent.createdAt,
 		});
-		this.changed();
+		this.changed("global", agent.agentId);
 	}
 	getAgent(agentId: string): AgentRecord | undefined {
 		const value = this.agents.get(agentId);
@@ -429,7 +468,7 @@ export class Store {
 				(agent as unknown as Record<string, unknown>)[key] =
 					structuredClone(value);
 		}
-		this.changed();
+		this.changed("agent", agentId);
 	}
 	createRun(
 		runId: string,
@@ -447,7 +486,7 @@ export class Store {
 			state,
 			createdAt: at,
 		});
-		this.changed();
+		this.changed("global");
 	}
 	updateRun(
 		runId: string,
@@ -464,7 +503,7 @@ export class Store {
 			run.finishedAt = at;
 		if (error) run.error = structuredClone(error);
 		if (usage !== undefined) run.usage = structuredClone(usage as UsageTotals);
-		this.changed();
+		this.changed("global");
 	}
 	getRun(runId: string): RunRecord | undefined {
 		const run = this.global.runs.find((value) => value.runId === runId);
@@ -480,7 +519,7 @@ export class Store {
 		const run = this.global.runs.find((value) => value.runId === runId);
 		if (!run) return;
 		run.usage = structuredClone(usage);
-		this.changed();
+		this.changed("global");
 	}
 	getRunUsage(runId: string): UsageTotals | null {
 		const usage = this.global.runs.find(
@@ -507,7 +546,7 @@ export class Store {
 		const run = this.global.runs.find((value) => value.runId === runId);
 		if (run) {
 			run.generation = generation;
-			this.changed();
+			this.changed("global");
 		}
 	}
 	getRunGeneration(runId: string): number | undefined {
@@ -529,7 +568,7 @@ export class Store {
 			data: structuredClone(data),
 			createdAt: at,
 		});
-		this.changed();
+		this.changed("global");
 		return id;
 	}
 	countRunEvents(runId: string, type: string): number {
@@ -582,7 +621,7 @@ export class Store {
 			response: structuredClone(response),
 			createdAt: at,
 		});
-		this.changed();
+		this.changed("global");
 	}
 	addMessage(message: MessageRecord): void {
 		if (
@@ -592,7 +631,7 @@ export class Store {
 		)
 			throw new Error(`Message ${message.messageId} already exists`);
 		this.global.messages.push(structuredClone(message));
-		this.changed();
+		this.changed("global");
 	}
 	nextMessageSequence(agentId: string): number {
 		return (
@@ -618,7 +657,7 @@ export class Store {
 		);
 		if (message) {
 			message.state = state;
-			this.changed();
+			this.changed("global");
 		}
 	}
 	toolStart(
@@ -649,7 +688,7 @@ export class Store {
 			state: "started",
 			startedAt: at,
 		});
-		this.changed();
+		this.changed("global");
 	}
 	toolFinish(
 		agentId: string,
@@ -666,7 +705,7 @@ export class Store {
 		if (operation) {
 			operation.state = "finished";
 			operation.finishedAt = at;
-			this.changed();
+			this.changed("global");
 		}
 	}
 	uncertainTools(
@@ -699,7 +738,7 @@ export class Store {
 		if (operation) {
 			operation.state = `reconciled_${resolution}`;
 			operation.finishedAt = at;
-			this.changed();
+			this.changed("global");
 		}
 	}
 	putCooldown(block: CooldownRecord): void {
@@ -708,7 +747,7 @@ export class Store {
 		);
 		if (index >= 0) this.global.cooldowns[index] = structuredClone(block);
 		else this.global.cooldowns.push(structuredClone(block));
-		this.changed();
+		this.changed("global");
 	}
 	getCooldown(scopeKey: string): CooldownRecord | undefined {
 		const value = this.global.cooldowns.find(
@@ -728,7 +767,7 @@ export class Store {
 		if (!block.probeAgentId || block.probeAgentId === agentId) {
 			block.probeAgentId = agentId;
 			block.updatedAt = at;
-			this.changed();
+			this.changed("global");
 			return agentId;
 		}
 		return block.probeAgentId;
@@ -740,14 +779,14 @@ export class Store {
 		if (block) {
 			delete block.probeAgentId;
 			block.updatedAt = at;
-			this.changed();
+			this.changed("global");
 		}
 	}
 	clearCooldown(scopeKey: string): void {
 		this.global.cooldowns = this.global.cooldowns.filter(
 			(value) => value.scopeKey !== scopeKey,
 		);
-		this.changed();
+		this.changed("global");
 	}
 	enqueueOutbox(
 		eventId: number,
@@ -766,7 +805,7 @@ export class Store {
 			attempts: 0,
 			createdAt: at,
 		});
-		this.changed();
+		this.changed("global");
 	}
 	pendingOutbox(
 		parentSessionId: string,
@@ -805,7 +844,7 @@ export class Store {
 		);
 		if (parent && eventIds.length)
 			parent.lastAckEventId = Math.max(parent.lastAckEventId, ...eventIds);
-		this.changed();
+		this.changed("global");
 	}
 	supersedeAgentOutbox(
 		parentSessionId: string,
@@ -823,7 +862,7 @@ export class Store {
 				item.state = "superseded";
 				item.deliveredAt = at;
 			}
-		this.changed();
+		this.changed("global");
 	}
 	attachParent(
 		parentSessionId: string,
@@ -848,7 +887,7 @@ export class Store {
 		parent.attached = true;
 		delete parent.detachedAt;
 		delete parent.detachReason;
-		this.changed();
+		this.changed("global");
 	}
 	detachParent(parentSessionId: string, reason: string, at: string): void {
 		const parent = this.global.parents.find(
@@ -858,7 +897,7 @@ export class Store {
 			parent.attached = false;
 			parent.detachedAt = at;
 			parent.detachReason = reason;
-			this.changed();
+			this.changed("global");
 		}
 	}
 	isParentAttached(parentSessionId: string): boolean {
@@ -875,7 +914,7 @@ export class Store {
 			barrier: structuredClone(barrier),
 			agentIds: [...agentIds],
 		});
-		this.changed();
+		this.changed("idle", barrier.idleId);
 	}
 	getIdle(idleId: string): IdleBarrierRecord | undefined {
 		const value = this.idles.get(idleId)?.barrier;
@@ -929,7 +968,7 @@ export class Store {
 			barrier.state = "resolved";
 			barrier.resolution = resolution;
 			barrier.resolvedAt = at;
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 	claimHeadless(idleId: string, runId: string): boolean {
@@ -940,7 +979,7 @@ export class Store {
 		barrier.headlessRunId = runId;
 		delete barrier.headlessPid;
 		delete barrier.headlessError;
-		this.changed();
+		this.changed("idle", idleId);
 		return true;
 	}
 	setHeadlessPid(idleId: string, runId: string, pid: number | undefined): void {
@@ -951,7 +990,7 @@ export class Store {
 		) {
 			if (pid === undefined) delete barrier.headlessPid;
 			else barrier.headlessPid = pid;
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 	resetHeadless(idleId: string, runId: string): void {
@@ -963,7 +1002,7 @@ export class Store {
 			barrier.headlessState = "none";
 			delete barrier.headlessRunId;
 			delete barrier.headlessPid;
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 	finishHeadless(
@@ -981,7 +1020,7 @@ export class Store {
 			delete barrier.headlessPid;
 			if (error === undefined) delete barrier.headlessError;
 			else barrier.headlessError = error;
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 	cancelIdle(idleId: string, at: string): void {
@@ -989,7 +1028,7 @@ export class Store {
 		if (barrier?.state === "pending") {
 			barrier.state = "cancelled";
 			barrier.resolvedAt = at;
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 	setIdleActivity(
@@ -1001,14 +1040,14 @@ export class Store {
 		if (barrier?.state === "pending") {
 			barrier.activityPolicy = policy;
 			barrier.wakeMode = wakeMode;
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 	updateIdleAgents(idleId: string, agentIds: string[]): void {
 		const idle = this.idles.get(idleId);
 		if (idle) {
 			idle.agentIds = [...agentIds];
-			this.changed();
+			this.changed("idle", idleId);
 		}
 	}
 }

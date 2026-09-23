@@ -47,7 +47,9 @@ export function registerCompactTool(pi: ExtensionAPI): void {
 					settled = true;
 					queueMicrotask(() => {
 						if (ctx.isIdle() && !ctx.hasPendingMessages()) {
-							pi.sendUserMessage("Compaction completed. Continue the task.");
+							pi.sendUserMessage(
+								"Compaction completed. Continue the task. Do not call compact again for this transition.",
+							);
 						}
 					});
 				},
@@ -63,7 +65,7 @@ export function registerCompactTool(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text" as const,
-						text: "Manual compaction queued.",
+						text: "Manual compaction queued; this is not confirmation that compaction completed.",
 					},
 				],
 				details: { status: "queued" as const },

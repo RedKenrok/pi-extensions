@@ -72,6 +72,23 @@ test("state uses separate versioned JSON documents", () => {
 	assert(existsSync(join(path, "global.json")));
 });
 
+test("agent-only updates do not rewrite unrelated state documents", () => {
+	const path = statePath("pi-tools-targeted-flush-");
+	const store = new Store(path);
+	const record = agent();
+	store.insertAgent(record, "task");
+	const globalPath = join(path, "global.json");
+	const before = readFileSync(globalPath, "utf8");
+	store.updateAgent(record.agentId, {
+		updatedAt: "2026-01-02T00:00:00.000Z",
+	});
+	assert.equal(readFileSync(globalPath, "utf8"), before);
+	assert.equal(
+		new Store(path).getAgent(record.agentId)?.updatedAt,
+		"2026-01-02T00:00:00.000Z",
+	);
+});
+
 test("a schema mismatch clears disposable state and requests restart", () => {
 	const path = statePath("pi-tools-version-");
 	new Store(path).close();
@@ -149,6 +166,12 @@ test("unfinished write operations remain visible for best-effort recovery", () =
 	assert.deepEqual(store.uncertainTools(record.agentId, record.currentRunId), [
 		{ toolCallId: "call-write", toolName: "write" },
 	]);
+	store.close();
+	const reopened = new Store(store.path);
+	assert.deepEqual(
+		reopened.uncertainTools(record.agentId, record.currentRunId),
+		[{ toolCallId: "call-write", toolName: "write" }],
+	);
 });
 
 test("idle barriers retain ordered membership", () => {

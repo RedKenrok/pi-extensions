@@ -201,7 +201,3 @@ export class AuthAdapter {
 		return unavailable("refresh_failed");
 	}
 }
-
-export function unsupportedPiResult(): AuthResult {
-	return unavailable("unsupported_pi");
-}

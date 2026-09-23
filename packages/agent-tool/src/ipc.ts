@@ -18,7 +18,7 @@ import { newSecret, stableHash } from "./ids.ts";
 import { prepareStateDirectory } from "./store.ts";
 
 export const PROTOCOL_VERSION = 1;
-export const SUPERVISOR_API_VERSION = 8;
+export const SUPERVISOR_API_VERSION = 9;
 export const SUPERVISOR_ENTRY_PATH = fileURLToPath(
 	new URL("./supervisor-entry.ts", import.meta.url),
 );
