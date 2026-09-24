@@ -72,10 +72,4 @@ The default safe-header mode includes common content, cache, redirect, and retry
 
 ## Development
 
-From the repository root:
-
-```sh
-npm run check
-```
-
 The tests cover defaults, safe headers, text truncation, binary previews, character encodings, HTML extraction and absolute links, cancellation, timeout signals, and JSON, NDJSON, XML, and HTML minification.

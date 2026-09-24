@@ -143,17 +143,7 @@ Pi 0.85.1's `AgentToolResult` type has no `isError` field. Failures therefore us
 
 ## Development and verification
 
-From the repository root:
-
-```sh
-npm install
-npm run check
-npm run test:payload
-```
-
 The workspace test suite uses synthetic credentials and HTTP/SSE fixtures. Coverage includes OAuth/account precedence and races, API-key rejection, timeouts and cancellation, lifecycle transitions, stale calls, unrelated-tool preservation, the exact tool schema, validated per-call model overrides, non-Codex conversation models, citations, Unicode and chunk boundaries, CRLF and multiline SSE, terminal-envelope fallback, premature EOF, failure events, absent search activity, output limits, redirects, status classification, model catalogs, and secret sanitization.
-
-`npm run test:payload` starts Pi 0.85.1 with an isolated empty `PI_CODING_AGENT_DIR` and a local synthetic provider. It captures the first provider request and verifies that the signed-out `research` schema, description, and instructions are absent. Because the check binds a loopback port, restricted sandboxes may require local-network permission.
 
 An offline RPC load check can be run from the repository root:
 

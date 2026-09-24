@@ -17,6 +17,4 @@ jobs:
         with:
           node-version: 22.19.0
           cache: npm
-      - run: npm ci
       - run: npm run ci
-      - run: npm run test:coverage

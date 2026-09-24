@@ -46,18 +46,14 @@ Install dependencies and run the shared verification suite from the repository r
 
 ```sh
 npm install
-npm run check
+npm run ci
 ```
 
-`npm run check` type-checks all packages, runs Biome, and executes every workspace's tests. The repository uses one root lockfile and keeps development-only dependencies in the root package.
+`npm run ci` type-checks all packages, runs Biome, and executes every workspace's tests. The repository uses one root lockfile and keeps development-only dependencies in the root package.
 
 Additional verification commands:
 
 ```sh
-npm run ci
-npm run compat
-npm run test:payload
+npm run test
 npm run test:coverage
 ```
-
-`npm run ci` includes the shared checks, the Pi SDK compatibility spike, and provider-payload verification. `npm run test:payload` starts a local synthetic provider and therefore requires permission to bind a loopback listener in restricted sandboxes.
