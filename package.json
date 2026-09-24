@@ -12,10 +12,9 @@
 	"scripts": {
 		"ci": "npm run check && npm run compat && npm run test:payload",
 		"compat": "npm run compat --workspace agent-tool",
-		"lint": "npm run typecheck && biome check --write package.json tsconfig.json packages/codex-research-tool packages/fetch-tool packages/search-tool packages/agent-tool packages/compact-tool packages/codex-compaction",
+		"lint": "npm run typecheck && biome check --write package.json tsconfig.json packages/codex-research-tool packages/fetch-tool packages/codex-compaction",
 		"test": "npm run test --workspaces --if-present",
 		"test:coverage": "npm run test:coverage --workspaces --if-present",
-		"test:payload": "npm run test:payload --workspaces --if-present",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {

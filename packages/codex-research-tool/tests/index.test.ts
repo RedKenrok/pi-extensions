@@ -58,7 +58,6 @@ function harness(options: {
 		model: { provider: "other", id: "conversation" },
 	} as unknown as ExtensionContext;
 	createResearchExtension({
-		version: "0.85.1",
 		readCredential: () => options.credential() as never,
 		resolveAccessToken: async () => (options.token ? options.token() : "token"),
 		client:
@@ -290,7 +289,6 @@ test("reload starts from fresh availability and unsupported Pi fails closed", as
 		setActiveTools() {},
 	} as unknown as ExtensionAPI;
 	createResearchExtension({
-		version: "0.86.0",
 		readCredential: () => ({
 			type: "oauth",
 			accountId: "account",

@@ -2,7 +2,6 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	readStoredCredential,
-	VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { AuthAdapter } from "./src/auth.ts";
 import {

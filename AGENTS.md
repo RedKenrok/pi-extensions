@@ -1,2 +1,1 @@
-- Use `openai-codex/gpt-6-luna` at `max for agents.
 - Run the linter (`npm run lint`) and tests (`npm run test`) after changing code.

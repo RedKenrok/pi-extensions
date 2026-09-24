@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerCompactTool } from "../../compact-tool/src/compact.ts";
 import { createCodexCompactionExtension } from "../index.ts";
 import { CODEX_RESPONSES_URL } from "../src/remote.ts";
 
@@ -201,40 +200,5 @@ test("remote failure retains native result and custom instructions delegate enti
 	assert.equal(
 		afterHybrid.preparation.fileOps.edited.has("old-write.ts"),
 		true,
-	);
-});
-
-test("compact-tool coexists and forwards instructions into the same Pi compaction lifecycle", async () => {
-	let tool: any;
-	const pi = {
-		registerTool(value: any) {
-			tool = value;
-		},
-	} as ExtensionAPI;
-	registerCompactTool(pi);
-	let options: any;
-	await tool.execute("id", { instructions: "focus" }, undefined, undefined, {
-		compact(value: any) {
-			options = value;
-		},
-		isIdle: () => false,
-		hasPendingMessages: () => false,
-		hasUI: false,
-	});
-	assert.equal(options.customInstructions, "focus");
-	const state = fixture();
-	assert.equal(
-		await state.handler(
-			{
-				preparation: state.preparation,
-				branchEntries: [],
-				customInstructions: options.customInstructions,
-				reason: "manual",
-				willRetry: false,
-				signal: new AbortController().signal,
-			},
-			state.ctx,
-		),
-		undefined,
 	);
 });
