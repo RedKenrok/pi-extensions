@@ -17,4 +17,5 @@ jobs:
         with:
           node-version: 22.19.0
           cache: npm
+      - run: npm install
       - run: npm run ci
