@@ -13,17 +13,17 @@ This repository is an npm workspace of Pi extension packages I have written for 
 The packages deliberately have different network and authentication boundaries:
 
 - `codex-research-tool` authenticates with Pi-managed `openai-codex` OAuth and sends only the supplied query plus fixed instructions to fixed `chatgpt.com` Codex endpoints. It does not forward the Pi conversation, workspace files, or local instructions.
-- `codex-compaction` sends only Pi's discarded conversation prefix to a fixed `chatgpt.com` Codex endpoint with Pi-managed OAuth. Its opaque checkpoint is account/model/endpoint-bound and is paired with a portable native text summary.
+- `codex-compaction` sends Pi's discarded conversation prefix, along with the system prompt and active tool schemas included in the compaction request, to a fixed `chatgpt.com` Codex endpoint with Pi-managed OAuth. Its opaque checkpoint is account/model/endpoint-bound and is paired with a portable native text summary.
 - `fetch-tool` sends requests to caller-selected HTTP(S) destinations and can forward caller-supplied secrets in headers or bodies. Destinations can include local and private-network services, including after redirects; no private-network destination policy is currently enforced.
 
 ## Requirements
 
 - Node.js 22.19.0 or newer.
-- Pi `@earendil-works/pi-coding-agent` `>=0.85.1`.
+- Pi `@earendil-works/pi-coding-agent` `>=0.85.1 <1.0.0` (extension packages declare this peer range). CI tests the pinned 0.85.1 minimum and 0.87.1 current compatibility set, with matching `pi-ai` and `pi-tui` peers where applicable. This does not claim compatibility with every release in the broad peer range.
 
 ## Installation and loading
 
-Install one package from the repository root:
+These packages are intentionally private, local-use extensions, not registry releases. Their manifests set `private: true`; do not publish them to npm. Install one package from a local checkout:
 
 ```sh
 pi install ./packages/fetch-tool
@@ -49,7 +49,7 @@ npm install
 npm run ci
 ```
 
-`npm run ci` type-checks all packages, runs Biome, and executes every workspace's tests. The repository uses one root lockfile and keeps development-only dependencies in the root package.
+`npm run ci` type-checks all packages, runs read-only Biome checks, executes every workspace's tests and coverage thresholds, and verifies local package archives plus isolated consumer installs with exact Pi peers, loads every advertised TypeScript extension entrypoint through Pi's loader, and checks Pi peer dependency resolution. The consumer verifier may fetch dependencies from the configured npm registry but never publishes packages. CI runs the suite on Node 22.19.0 (the declared minimum), 24.x, and 26.x against coherent Pi peer versions 0.85.1 and 0.87.1. The current-version job installs overrides in its ephemeral CI checkout without saving them to the lockfile; local consumers of the verifier are scratch directories. The repository uses one root lockfile and keeps development-only dependencies in the root package.
 
 Additional verification commands:
 

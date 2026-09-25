@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -65,13 +66,23 @@ export function createResearchExtension(
 ): (pi: ExtensionAPI) => void {
 	return (pi: ExtensionAPI): void => {
 		let generation = 0;
+		let availabilityCheckToken = 0;
 		let registered = false;
+		let registeredGeneration = 0;
 		let availability: Availability = { kind: "unchecked" };
 		let blockedUntilRefresh = false;
 		let disabledByExtension = false;
 		let lastNotice: string | undefined;
 		let lastContext: ExtensionContext | undefined;
 		const runtimeController = new AbortController();
+		const executionGeneration = new AsyncLocalStorage<number>();
+		let activeAvailabilityCheck:
+			| {
+					controller: AbortController;
+					timeout: ReturnType<typeof setTimeout>;
+					onRuntimeAbort: () => void;
+			  }
+			| undefined;
 		const client =
 			dependencies.client ??
 			new CodexClient({
@@ -87,6 +98,25 @@ export function createResearchExtension(
 						? lastContext.modelRegistry.getApiKeyForProvider("openai-codex")
 						: Promise.resolve(undefined),
 		});
+
+		const cleanupAvailabilityCheck = (
+			check: NonNullable<typeof activeAvailabilityCheck>,
+		): void => {
+			clearTimeout(check.timeout);
+			runtimeController.signal.removeEventListener(
+				"abort",
+				check.onRuntimeAbort,
+			);
+			if (activeAvailabilityCheck === check)
+				activeAvailabilityCheck = undefined;
+		};
+
+		const abortAvailabilityCheck = (reason: unknown): void => {
+			const check = activeAvailabilityCheck;
+			if (!check) return;
+			cleanupAvailabilityCheck(check);
+			check.controller.abort(reason);
+		};
 
 		const notice = (
 			ctx: ExtensionContext,
@@ -134,24 +164,43 @@ export function createResearchExtension(
 
 		const registerOnce = (ctx: ExtensionContext): void => {
 			if (registered) return;
-			pi.registerTool(
-				createResearchTool({
-					authCheck: (signal) =>
-						auth.check({ ...(signal ? { signal } : {}), timeoutMs: 5_000 }),
-					client,
-					runtimeSignal: runtimeController.signal,
-					onUnavailable(reason, code) {
-						const current = lastContext ?? ctx;
-						const message = backendMessage(code ?? "backend_incompatible");
-						availability = {
-							kind: "unavailable",
-							message,
-						};
-						deactivate(current, message, reason === "backend");
-					},
-				}),
-			);
+			const tool = createResearchTool({
+				authCheck: (signal) =>
+					auth.check({ ...(signal ? { signal } : {}), timeoutMs: 5_000 }),
+				client,
+				runtimeSignal: runtimeController.signal,
+				onUnavailable(reason, code) {
+					if (
+						(executionGeneration.getStore() ?? registeredGeneration) !==
+							generation ||
+						runtimeController.signal.aborted
+					)
+						return;
+					const current = lastContext ?? ctx;
+					const message = backendMessage(code ?? "backend_incompatible");
+					availability = {
+						kind: "unavailable",
+						message,
+					};
+					if (reason === "credentials" || code === "auth_required")
+						auth.invalidate();
+					deactivate(
+						current,
+						message,
+						reason === "backend" && code !== "auth_required",
+					);
+				},
+			});
+			const originalExecute = tool.execute;
+			pi.registerTool({
+				...tool,
+				execute: (...args) =>
+					executionGeneration.run(registeredGeneration, () =>
+						originalExecute(...args),
+					),
+			});
 			registered = true;
+			registeredGeneration = generation;
 			enableResearch(pi);
 			disabledByExtension = false;
 		};
@@ -161,7 +210,18 @@ export function createResearchExtension(
 			explicit: boolean,
 		): Promise<void> => {
 			lastContext = ctx;
-			const checkGeneration = generation;
+			if (explicit) generation += 1;
+			const checkGeneration = ++availabilityCheckToken;
+			const checkLifecycle = generation;
+			const isCurrent = () =>
+				checkGeneration === availabilityCheckToken &&
+				checkLifecycle === generation;
+			abortAvailabilityCheck(
+				new DOMException(
+					"Research availability check superseded",
+					"AbortError",
+				),
+			);
 			if (blockedUntilRefresh && !explicit) {
 				if (registered) removeResearch(pi);
 				return;
@@ -169,6 +229,7 @@ export function createResearchExtension(
 			if (explicit) {
 				blockedUntilRefresh = false;
 				lastNotice = undefined;
+				auth.invalidate();
 				client.invalidateModel();
 			}
 			const availabilityController = new AbortController();
@@ -184,6 +245,12 @@ export function createResearchExtension(
 			);
 			const onRuntimeAbort = () =>
 				availabilityController.abort(runtimeController.signal.reason);
+			const availabilityCheck = {
+				controller: availabilityController,
+				timeout,
+				onRuntimeAbort,
+			};
+			activeAvailabilityCheck = availabilityCheck;
 			runtimeController.signal.addEventListener("abort", onRuntimeAbort, {
 				once: true,
 			});
@@ -193,12 +260,24 @@ export function createResearchExtension(
 					signal: availabilityController.signal,
 					timeoutMs: 5_000,
 				});
-				if (checkGeneration !== generation || runtimeController.signal.aborted)
+				if (!isCurrent() || runtimeController.signal.aborted) return;
+				if (availabilityController.signal.aborted) {
+					const message = backendMessage("timeout");
+					availability = { kind: "unavailable", message };
+					deactivate(ctx, message, true);
 					return;
+				}
 				if (result.kind === "ready") {
 					try {
 						await client.selectModel(result, availabilityController.signal);
 					} catch (cause) {
+						if (!isCurrent() || runtimeController.signal.aborted) return;
+						if (availabilityController.signal.aborted) {
+							const message = backendMessage("timeout");
+							availability = { kind: "unavailable", message };
+							deactivate(ctx, message, true);
+							return;
+						}
 						const error =
 							cause instanceof ResearchError
 								? cause
@@ -207,7 +286,15 @@ export function createResearchExtension(
 										"Research could not verify Codex backend compatibility.",
 										false,
 									);
+						if (error.code === "auth_required") auth.invalidate();
 						const message = backendMessage(error.code);
+						availability = { kind: "unavailable", message };
+						deactivate(ctx, message, true);
+						return;
+					}
+					if (!isCurrent() || runtimeController.signal.aborted) return;
+					if (availabilityController.signal.aborted) {
+						const message = backendMessage("timeout");
 						availability = { kind: "unavailable", message };
 						deactivate(ctx, message, true);
 						return;
@@ -216,6 +303,7 @@ export function createResearchExtension(
 					if (!registered) {
 						registerOnce(ctx);
 					} else if (explicit) {
+						registeredGeneration = generation;
 						enableResearch(pi);
 						disabledByExtension = false;
 					} else if (disabledByExtension) {
@@ -227,10 +315,16 @@ export function createResearchExtension(
 				}
 				availability = { kind: "unavailable", message: result.message };
 				if (registered) removeResearch(pi);
+				disabledByExtension = true;
+				if (
+					result.reason === "missing_oauth" ||
+					result.reason === "refresh_failed" ||
+					result.reason === "missing_account_id"
+				)
+					auth.invalidate();
 				notice(ctx, result.message, "warning");
 			} finally {
-				clearTimeout(timeout);
-				runtimeController.signal.removeEventListener("abort", onRuntimeAbort);
+				cleanupAvailabilityCheck(availabilityCheck);
 			}
 		};
 
@@ -253,6 +347,7 @@ export function createResearchExtension(
 
 		pi.on("session_start", async (_event, ctx) => {
 			generation += 1;
+			if (registered) registeredGeneration = generation;
 			lastContext = ctx;
 			blockedUntilRefresh = false;
 			await checkAvailability(ctx, false);
@@ -265,9 +360,10 @@ export function createResearchExtension(
 
 		pi.on("session_shutdown", () => {
 			generation += 1;
-			runtimeController.abort(
-				new DOMException("Pi session ended", "AbortError"),
-			);
+			availabilityCheckToken += 1;
+			const reason = new DOMException("Pi session ended", "AbortError");
+			abortAvailabilityCheck(reason);
+			runtimeController.abort(reason);
 			auth.dispose();
 		});
 	};

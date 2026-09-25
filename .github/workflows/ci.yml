@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22.19.0, 24.x, 26.x]
+        pi: [0.85.1, 0.87.1]
+    env:
+      PI_VERSION: ${{ matrix.pi }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Install exact Pi matrix peers
+        run: |
+          npm install --no-save --package-lock=false \
+            @earendil-works/pi-coding-agent@${PI_VERSION} \
+            @earendil-works/pi-ai@${PI_VERSION} \
+            @earendil-works/pi-tui@${PI_VERSION}
+      - run: npm run ci

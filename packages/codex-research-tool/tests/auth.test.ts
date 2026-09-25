@@ -10,6 +10,24 @@ function jwt(accountId: unknown): string {
 	})}.signature`;
 }
 
+function deferred<T>(): {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (reason?: unknown) => void;
+} {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((promiseResolve, promiseReject) => {
+		resolve = promiseResolve;
+		reject = promiseReject;
+	});
+	return { promise, resolve, reject };
+}
+
+function nextTurn(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
 test("extracts only the ChatGPT account claim from a JWT", () => {
 	assert.equal(extractAccountIdFromToken(jwt(" account-1 ")), "account-1");
 	assert.equal(extractAccountIdFromToken(jwt("   ")), undefined);
@@ -124,6 +142,28 @@ test("serializes concurrent token refreshes", async () => {
 	assert.equal(resolves, 1);
 });
 
+test("invalidation does not abandon a check awaiting credentials", async () => {
+	const credential = deferred<{ type: "oauth"; accountId: string }>();
+	let refreshes = 0;
+	const adapter = new AuthAdapter({
+		readCredential: () => credential.promise,
+		resolveAccessToken: async () => {
+			refreshes += 1;
+			return jwt("account");
+		},
+	});
+
+	const first = adapter.check();
+	await nextTurn();
+	adapter.invalidate();
+	const second = adapter.check();
+	credential.resolve({ type: "oauth", accountId: "account" });
+
+	assert.equal((await first).kind, "ready");
+	assert.equal((await second).kind, "ready");
+	assert.equal(refreshes, 1);
+});
+
 test("bounds a hung refresh and supports caller cancellation", async () => {
 	const adapter = new AuthAdapter({
 		readCredential: () => ({ type: "oauth", accountId: "account" }),
@@ -138,6 +178,95 @@ test("bounds a hung refresh and supports caller cancellation", async () => {
 	controller.abort();
 	const cancelled = await adapter.check({ signal: controller.signal });
 	assert.equal(cancelled.kind, "unavailable");
+});
+
+test("does not overlap a timed-out refresh", async () => {
+	const firstRefresh = deferred<string>();
+	let refreshes = 0;
+	const adapter = new AuthAdapter({
+		readCredential: () => ({ type: "oauth", accountId: "account" }),
+		resolveAccessToken: () => {
+			refreshes += 1;
+			return refreshes === 1
+				? firstRefresh.promise
+				: Promise.resolve(jwt("account"));
+		},
+	});
+
+	const timedOut = await adapter.check({ timeoutMs: 10 });
+	assert.equal(timedOut.kind, "unavailable");
+	if (timedOut.kind === "unavailable")
+		assert.equal(timedOut.reason, "check_timeout");
+
+	adapter.invalidate();
+	const overlapping = await adapter.check();
+	assert.equal(overlapping.kind, "unavailable");
+	if (overlapping.kind === "unavailable")
+		assert.equal(overlapping.reason, "check_timeout");
+	assert.equal(refreshes, 1);
+
+	firstRefresh.resolve(jwt("account"));
+	await nextTurn();
+	const recovered = await adapter.check();
+	assert.equal(recovered.kind, "ready");
+	assert.equal(refreshes, 2);
+});
+
+test("cancelling one concurrent caller does not cancel the shared refresh", async () => {
+	const refresh = deferred<string>();
+	let refreshes = 0;
+	const adapter = new AuthAdapter({
+		readCredential: () => ({ type: "oauth", accountId: "account" }),
+		resolveAccessToken: () => {
+			refreshes += 1;
+			return refresh.promise;
+		},
+	});
+	const controller = new AbortController();
+	const cancelled = adapter.check({ signal: controller.signal });
+	const shared = adapter.check();
+
+	controller.abort();
+	const cancelledResult = await cancelled;
+	assert.equal(cancelledResult.kind, "unavailable");
+	if (cancelledResult.kind === "unavailable")
+		assert.equal(cancelledResult.reason, "check_timeout");
+	let sharedSettled = false;
+	void shared.then(() => {
+		sharedSettled = true;
+	});
+	await Promise.resolve();
+	assert.equal(sharedSettled, false);
+
+	refresh.resolve(jwt("account"));
+	const sharedResult = await shared;
+	assert.equal(sharedResult.kind, "ready");
+	assert.equal(refreshes, 1);
+});
+
+test("handles a late refresh rejection after timeout safely", async () => {
+	const lateRefresh = deferred<string>();
+	let refreshes = 0;
+	const adapter = new AuthAdapter({
+		readCredential: () => ({ type: "oauth", accountId: "account" }),
+		resolveAccessToken: () => {
+			refreshes += 1;
+			return refreshes === 1
+				? lateRefresh.promise
+				: Promise.resolve(jwt("account"));
+		},
+	});
+
+	const timedOut = await adapter.check({ timeoutMs: 10 });
+	assert.equal(timedOut.kind, "unavailable");
+	if (timedOut.kind === "unavailable")
+		assert.equal(timedOut.reason, "check_timeout");
+	lateRefresh.reject(new Error("late refresh failure"));
+	await nextTurn();
+
+	const recovered = await adapter.check();
+	assert.equal(recovered.kind, "ready");
+	assert.equal(refreshes, 2);
 });
 
 test("sanitized failures never expose token or account secrets", async () => {

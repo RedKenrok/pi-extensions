@@ -9,7 +9,7 @@ import {
 	DEFAULT_MAX_RESPONSE_SIZE,
 	DEFAULT_TIMEOUT,
 } from "./constants.ts";
-import { buildErrorResponse, normalizeError } from "./error.ts";
+import { normalizeError } from "./error.ts";
 import { buildHeaders, findHeaderKey } from "./headers.ts";
 import { minifyText } from "./minify.ts";
 import { createTimeoutSignal, type FetchBody } from "./request.ts";
@@ -226,6 +226,17 @@ const getStringByteLength = (value: string): number => {
 	return textEncoder.encode(value).byteLength;
 };
 
+const cancelResponseBody = (response: Response): void => {
+	try {
+		const cancellation = response.body?.cancel();
+		if (cancellation) {
+			void Promise.resolve(cancellation).catch(() => undefined);
+		}
+	} catch {
+		// Cleanup must not replace the original failure.
+	}
+};
+
 const truncateText = (
 	value: string,
 	maxBytes: number,
@@ -245,9 +256,17 @@ const truncateText = (
 		};
 	}
 
-	const content = new TextDecoder()
-		.decode(encoded.subarray(0, maxBytes))
-		.replace(/\uFFFD$/, "");
+	let end = Math.min(maxBytes, encoded.byteLength);
+	let content = "";
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	while (end > 0) {
+		try {
+			content = decoder.decode(encoded.subarray(0, end));
+			break;
+		} catch {
+			end--;
+		}
+	}
 	return {
 		content,
 		outputSize: encoded.byteLength,
@@ -278,7 +297,9 @@ const getCharset = (contentType: string, bytes: Uint8Array): string => {
 const decodeText = (bytes: Uint8Array, contentType: string): string => {
 	try {
 		return new TextDecoder(getCharset(contentType, bytes)).decode(bytes);
-	} catch {
+	} catch (error) {
+		if (error instanceof DOMException && error.name === "AbortError")
+			throw error;
 		return new TextDecoder().decode(bytes);
 	}
 };
@@ -291,26 +312,6 @@ const getContentLength = (response: Response): number | undefined => {
 
 	const parsed = Number(header);
 	return Number.isFinite(parsed) ? parsed : undefined;
-};
-
-const validateContentLength = (
-	response: Response,
-	maxResponseSize: number,
-): void => {
-	const contentLength = getContentLength(response);
-
-	if (contentLength !== undefined && contentLength > maxResponseSize) {
-		throw Object.assign(
-			new Error(
-				`Response size (${contentLength} bytes) exceeds maximum allowed size (${maxResponseSize} bytes)`,
-			),
-			{
-				errorType: "size_limit",
-				maxSize: maxResponseSize,
-				actualSize: contentLength,
-			},
-		);
-	}
 };
 
 const buildResultText = (
@@ -353,7 +354,10 @@ const buildResultText = (
 	}
 
 	if (truncated) {
-		resultText += `\n\n[Response truncated: showing up to the configured output limit from ${outputSize} output bytes.]`;
+		resultText +=
+			bodyType === "binary"
+				? `\n\n[Response truncated: downloaded ${bodySize} bytes; showing a ${outputSize}-byte preview.]`
+				: `\n\n[Response truncated: showing up to the configured output limit from ${outputSize} output bytes.]`;
 	}
 
 	return resultText;
@@ -418,6 +422,7 @@ export default () => ({
 				description: "Timeout (ms)",
 				default: DEFAULT_TIMEOUT,
 				minimum: 100,
+				maximum: 2_147_483_647,
 			}),
 		),
 
@@ -486,23 +491,28 @@ export default () => ({
 					? "none"
 					: "safe";
 
-		if (timeout < 100) {
-			return buildErrorResponse("Error: Timeout must be at least 100ms", {
-				errorType: "validation",
-				message: "Timeout must be at least 100ms",
-			});
+		if (
+			!Number.isFinite(timeout) ||
+			!Number.isInteger(timeout) ||
+			timeout < 100 ||
+			timeout > 2_147_483_647
+		) {
+			throw Object.assign(
+				new Error("Timeout must be between 100ms and 2147483647ms"),
+				{ errorType: "validation" },
+			);
 		}
 		if (
 			!Number.isFinite(maxOutputSize) ||
+			!Number.isInteger(maxOutputSize) ||
 			maxOutputSize < 1024 ||
 			maxOutputSize > DEFAULT_MAX_RESPONSE_SIZE
 		) {
-			return buildErrorResponse(
-				`Error: maxOutputSize must be between 1024 and ${DEFAULT_MAX_RESPONSE_SIZE} bytes`,
-				{
-					errorType: "validation",
-					message: `maxOutputSize must be between 1024 and ${DEFAULT_MAX_RESPONSE_SIZE} bytes`,
-				},
+			throw Object.assign(
+				new Error(
+					`maxOutputSize must be between 1024 and ${DEFAULT_MAX_RESPONSE_SIZE} bytes`,
+				),
+				{ errorType: "validation" },
 			);
 		}
 
@@ -510,18 +520,35 @@ export default () => ({
 		try {
 			urlObj = validateUrl(params.url);
 		} catch (error) {
-			return buildErrorResponse(
-				`Error: ${error instanceof Error ? error.message : "Invalid URL"}`,
-				{
-					errorType: "validation",
-					message: error instanceof Error ? error.message : "Invalid URL",
-				},
+			throw Object.assign(
+				new Error(error instanceof Error ? error.message : "Invalid URL"),
+				{ errorType: "validation" },
 			);
 		}
 
+		if ((method === "GET" || method === "HEAD") && params.body !== undefined) {
+			throw Object.assign(
+				new Error(`${method} requests cannot include a body`),
+				{ errorType: "validation" },
+			);
+		}
 		const headers = buildHeaders(params.headers);
 		const originalUrl = urlObj.toString();
+		const deadline = Date.now() + timeout;
 		const timeoutContext = createTimeoutSignal(signal, timeout);
+		const checkDeadline = () => {
+			timeoutContext.signal?.throwIfAborted();
+			if (Date.now() >= deadline) {
+				throw Object.assign(
+					new DOMException("Request deadline exceeded", "AbortError"),
+					{ errorType: "timeout" },
+				);
+			}
+		};
+
+		let response: Response | undefined;
+		let bodyOwned = false;
+		let bodyCleanupAttempted = false;
 
 		try {
 			const fetchOptions: RequestInit = {
@@ -535,7 +562,8 @@ export default () => ({
 				headers,
 				params.body as FetchBody | undefined,
 			);
-			const response = await fetch(originalUrl, fetchOptions);
+			response = await fetch(originalUrl, fetchOptions);
+			checkDeadline();
 
 			const status = response.status;
 			const statusText = response.statusText;
@@ -555,8 +583,20 @@ export default () => ({
 					? Math.max(DEFAULT_MAX_RESPONSE_SIZE, DEFAULT_MAX_DOWNLOAD_SIZE)
 					: DEFAULT_MAX_RESPONSE_SIZE;
 
-			if (!isNoBodyResponse) {
-				validateContentLength(response, downloadLimit);
+			const declaredLength = getContentLength(response);
+			if (declaredLength !== undefined && declaredLength > downloadLimit) {
+				bodyCleanupAttempted = true;
+				cancelResponseBody(response);
+				throw Object.assign(
+					new Error(
+						`Response size (${declaredLength} bytes) exceeds maximum allowed size (${downloadLimit} bytes)`,
+					),
+					{
+						errorType: "size_limit",
+						maxSize: downloadLimit,
+						actualSize: declaredLength,
+					},
+				);
 			}
 
 			let bodyType: BodyType = "text";
@@ -570,19 +610,30 @@ export default () => ({
 
 			if (isNoBodyResponse) {
 				bodyType = "none";
+				bodyCleanupAttempted = true;
+				cancelResponseBody(response);
 			} else {
-				const rawBytes = await readResponseWithLimit(response, downloadLimit);
+				bodyOwned = true;
+				const rawBytes = await readResponseWithLimit(
+					response,
+					downloadLimit,
+					timeoutContext.signal,
+				);
 				bodySize = rawBytes.byteLength;
 
+				checkDeadline();
 				if (isHtmlResponse) {
 					const html = decodeText(rawBytes, contentType);
+					checkDeadline();
 					pageTitle =
 						domino.createDocument(html, true).title.trim() || undefined;
 					const shouldConvertToMarkdown = params.markdown === true;
 
 					if (shouldConvertToMarkdown) {
 						try {
+							checkDeadline();
 							const converted = convertHtmlToMarkdown(html, finalUrl);
+							checkDeadline();
 							bodyContent = converted.content;
 							pageTitle = converted.title;
 							bodyType = "markdown";
@@ -607,8 +658,10 @@ export default () => ({
 					truncated = rawBytes.byteLength > DEFAULT_BINARY_PREVIEW_SIZE;
 				}
 
+				checkDeadline();
 				if (minify && bodyType === "text" && bodyContent) {
 					const minifyResult = minifyText(bodyContent, contentType);
+					checkDeadline();
 					bodyContent = minifyResult.content;
 					minified = minifyResult.minified;
 				}
@@ -631,8 +684,11 @@ export default () => ({
 				bodyContent,
 				bodySize,
 				truncated,
-				bodyType === "binary" ? bodySize : bodyOutputSize,
+				bodyType === "binary"
+					? Math.min(bodySize, DEFAULT_BINARY_PREVIEW_SIZE)
+					: bodyOutputSize,
 			);
+			checkDeadline();
 
 			return {
 				content: [
@@ -670,18 +726,27 @@ export default () => ({
 
 					truncated,
 
+					previewSize:
+						bodyType === "binary"
+							? Math.min(bodySize, DEFAULT_BINARY_PREVIEW_SIZE)
+							: undefined,
+
 					minified,
 				},
 			};
 		} catch (error) {
+			if (response && !bodyOwned && !bodyCleanupAttempted) {
+				bodyCleanupAttempted = true;
+				cancelResponseBody(response);
+			}
 			const normalized = normalizeError(
 				error,
 				originalUrl,
 				timeout,
 				timeoutContext.getAbortCause(),
 			);
-			return buildErrorResponse(
-				`Error fetching ${params.url}: ${normalized.message}`,
+			throw Object.assign(
+				new Error(`Error fetching ${params.url}: ${normalized.message}`),
 				normalized,
 			);
 		} finally {

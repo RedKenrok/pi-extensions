@@ -5,7 +5,6 @@ import type { AuthResult } from "../src/auth.ts";
 import { type CodexClient, ResearchError } from "../src/codex.ts";
 import {
 	createResearchTool,
-	formatError,
 	formatSuccess,
 	MAX_RESULT_CHARS,
 	RESEARCH_DEADLINE_MS,
@@ -156,15 +155,11 @@ test("rejects empty and overlong input before auth or transport", async (t) => {
 	});
 	for (const query of ["   ", "x".repeat(4001)]) {
 		await t.test(String(query.length), async () => {
-			const result = await tool.execute(
-				"call",
-				{ query },
-				undefined,
-				undefined,
-				context,
+			await assert.rejects(
+				tool.execute("call", { query }, undefined, undefined, context),
+				(error: unknown) =>
+					error instanceof ResearchError && error.code === "invalid_input",
 			);
-			assert.equal(result.details.status, "error");
-			assert.equal(result.details.error?.code, "invalid_input");
 		});
 	}
 	assert.equal(authCalls, 0);
@@ -180,22 +175,28 @@ test("rejects invalid model and effort values before authentication", async () =
 		client: fakeClient(),
 		onUnavailable() {},
 	});
-	const result = await tool.execute(
-		"call",
-		{ query: "question", model: "   " },
-		undefined,
-		undefined,
-		context,
+	await assert.rejects(
+		tool.execute(
+			"call",
+			{ query: "question", model: "   " },
+			undefined,
+			undefined,
+			context,
+		),
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "invalid_input",
 	);
-	assert.equal(result.details.error?.code, "invalid_input");
-	const effortResult = await tool.execute(
-		"call-effort",
-		{ query: "question", effort: "   " },
-		undefined,
-		undefined,
-		context,
+	await assert.rejects(
+		tool.execute(
+			"call-effort",
+			{ query: "question", effort: "   " },
+			undefined,
+			undefined,
+			context,
+		),
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "invalid_input",
 	);
-	assert.equal(effortResult.details.error?.code, "invalid_input");
 	assert.equal(authCalls, 0);
 });
 
@@ -219,16 +220,21 @@ test("returns catalog model and reasoning options for an unavailable choice", as
 		}),
 		onUnavailable() {},
 	});
-	const result = await tool.execute(
-		"call",
-		{ query: "question", model: "missing", effort: "xhigh" },
-		undefined,
-		undefined,
-		context,
+	await assert.rejects(
+		tool.execute(
+			"call",
+			{ query: "question", model: "missing", effort: "xhigh" },
+			undefined,
+			undefined,
+			context,
+		),
+		(error: unknown) => {
+			assert.ok(error instanceof ResearchError);
+			assert.match(error.message, /gpt-a: low, high \(default\)/);
+			assert.deepEqual(error.modelOptions, options);
+			return true;
+		},
 	);
-	const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-	assert.match(text, /gpt-a: low, high \(default\)/);
-	assert.deepEqual(result.details.error?.modelOptions, options);
 });
 
 test("returns an explicit uncited warning", () => {
@@ -341,7 +347,7 @@ test("collapsed and expanded TUI renderers keep the result contract readable", (
 	);
 });
 
-test("auth loss disables before any backend request and errors are explicit", async () => {
+test("auth loss disables before any backend request and rejects", async () => {
 	let transportCalls = 0;
 	let disabled = false;
 	const tool = createResearchTool({
@@ -360,20 +366,13 @@ test("auth loss disables before any backend request and errors are explicit", as
 			disabled = true;
 		},
 	});
-	const result = await tool.execute(
-		"call",
-		{ query: "q" },
-		undefined,
-		undefined,
-		context,
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, undefined, undefined, context),
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "auth_required",
 	);
 	assert.equal(transportCalls, 0);
 	assert.equal(disabled, true);
-	assert.equal(result.details.status, "error");
-	assert.match(
-		result.content[0]?.type === "text" ? result.content[0].text : "",
-		/Status: error/,
-	);
 });
 
 test("backend compatibility failures deactivate while rate limits remain active", async (t) => {
@@ -395,20 +394,21 @@ test("backend compatibility failures deactivate while rate limits remain active"
 					disabled = true;
 				},
 			});
-			const result = await tool.execute(
-				"call",
-				{ query: "q" },
-				undefined,
-				undefined,
-				context,
+			await assert.rejects(
+				tool.execute("call", { query: "q" }, undefined, undefined, context),
+				(error: unknown) => {
+					assert.ok(error instanceof ResearchError);
+					assert.equal(error.code, code);
+					assert.equal(error.message, "sanitized");
+					return true;
+				},
 			);
 			assert.equal(disabled, expectedDisabled);
-			assert.equal(result.details.error?.code, code);
 		});
 	}
 });
 
-test("Pi cancellation produces a controlled cancelled result", async () => {
+test("Pi cancellation rejects as cancelled without disabling the tool", async () => {
 	const controller = new AbortController();
 	const tool = createResearchTool({
 		authCheck: async () => auth,
@@ -438,8 +438,88 @@ test("Pi cancellation produces a controlled cancelled result", async () => {
 		context,
 	);
 	controller.abort();
-	const result = await pending;
-	assert.equal(result.details.error?.code, "cancelled");
+	await assert.rejects(pending, (error: unknown) => {
+		assert.ok(error instanceof ResearchError);
+		assert.equal(error.code, "cancelled");
+		assert.equal(error.message, "Research was cancelled.");
+		return true;
+	});
+});
+
+test("cancellation wins over a simultaneous access denial without disabling", async () => {
+	const controller = new AbortController();
+	let disabled = false;
+	const tool = createResearchTool({
+		authCheck: async () => auth,
+		client: fakeClient({
+			runResearch: async () => {
+				controller.abort();
+				throw new ResearchError(
+					"access_denied",
+					"The backend denied access.",
+					false,
+				);
+			},
+		}),
+		onUnavailable() {
+			disabled = true;
+		},
+	});
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, controller.signal, undefined, context),
+		(error: unknown) => {
+			assert.ok(error instanceof ResearchError);
+			assert.equal(error.code, "cancelled");
+			return true;
+		},
+	);
+	assert.equal(disabled, false);
+});
+
+test("auth check timeouts reject as timeout without disabling", async () => {
+	let disabled = false;
+	const tool = createResearchTool({
+		authCheck: async () =>
+			({
+				kind: "unavailable",
+				reason: "check_timeout",
+				message: "timed out",
+			}) as AuthResult,
+		client: fakeClient(),
+		onUnavailable() {
+			disabled = true;
+		},
+	});
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, undefined, undefined, context),
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "timeout",
+	);
+	assert.equal(disabled, false);
+});
+
+test("abort after auth readiness prevents model selection", async () => {
+	const controller = new AbortController();
+	let selected = false;
+	const tool = createResearchTool({
+		authCheck: async () => {
+			controller.abort();
+			return auth;
+		},
+		client: fakeClient({
+			selectModel: async () => {
+				selected = true;
+				return "m";
+			},
+		}),
+		onUnavailable() {},
+	});
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, controller.signal, undefined, context),
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "cancelled",
+	);
+	assert.equal(selected, false);
 });
 
 test("the total deadline produces a controlled timeout", async () => {
@@ -456,26 +536,13 @@ test("the total deadline produces a controlled timeout", async () => {
 		}),
 		onUnavailable() {},
 	});
-	const result = await tool.execute(
-		"call",
-		{ query: "q" },
-		undefined,
-		undefined,
-		context,
-	);
-	assert.equal(result.details.error?.code, "timeout");
-});
-
-test("failure content is sanitized and structured", () => {
-	const result = formatError(
-		"q",
-		new ResearchError("network", "Safe message", true, 3),
-		12,
-		false,
-	);
-	assert.equal(result.details.error?.retryAfterSeconds, 3);
-	assert.match(
-		result.content[0]?.type === "text" ? result.content[0].text : "",
-		/^Status: error/,
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, undefined, undefined, context),
+		(error: unknown) => {
+			assert.ok(error instanceof ResearchError);
+			assert.equal(error.code, "timeout");
+			assert.equal(error.message, "Research timed out after 10 minutes.");
+			return true;
+		},
 	);
 });

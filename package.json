@@ -10,10 +10,11 @@
 		"packages/*"
 	],
 	"scripts": {
-		"ci": "biome check package.json tsconfig.json packages/codex-research-tool packages/fetch-tool packages/codex-compaction && tsc --noEmit && npm run test && npm run test:coverage",
-		"lint": "biome check --write package.json tsconfig.json packages/codex-research-tool packages/fetch-tool packages/codex-compaction && tsc --noEmit",
-		"test": "npm run test --workspaces --if-present",
-		"test:coverage": "npm run test:coverage --workspaces --if-present"
+		"ci": "npm run lint && npm run test && npm run test:coverage && node scripts/verify-packages.mjs",
+		"lint": "biome check --error-on-warnings package.json tsconfig.json packages scripts && tsc --noEmit",
+		"lint:fix": "biome check --write package.json tsconfig.json packages scripts && tsc --noEmit",
+		"test": "npm run test --workspaces",
+		"test:coverage": "npm run test:coverage --workspaces"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.14",

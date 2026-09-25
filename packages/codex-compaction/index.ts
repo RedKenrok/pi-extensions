@@ -71,9 +71,12 @@ function summaryItem(item: unknown, summary: string): boolean {
 	return isRecord(part) && part.type === "input_text" && part.text === expected;
 }
 
+const AUTH_RESOLUTION_TIMEOUT_MS = 10_000;
+
 async function identity(
 	ctx: ExtensionContext,
 	model: Model<Api>,
+	signal?: AbortSignal,
 ): Promise<
 	| {
 			apiKey: string;
@@ -84,25 +87,56 @@ async function identity(
 	  }
 	| undefined
 > {
-	if (!isTrustedModel(model) || !ctx.modelRegistry.isUsingOAuth(model))
-		return undefined;
-	const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!resolved.ok || !resolved.apiKey) return undefined;
 	if (
-		resolved.baseUrl !== undefined &&
-		resolved.baseUrl.replace(/\/+$/, "") !== CODEX_BASE_URL
+		!isTrustedModel(model) ||
+		!ctx.modelRegistry.isUsingOAuth(model) ||
+		signal?.aborted
 	)
 		return undefined;
-	const accountId = accountIdFromToken(resolved.apiKey);
-	if (!accountId) return undefined;
-	const headers = stringHeaders(resolved.headers);
-	return {
-		apiKey: resolved.apiKey,
-		accountId,
-		fingerprint: accountFingerprint(accountId),
-		...(headers ? { headers } : {}),
-		...(resolved.env ? { env: resolved.env } : {}),
-	};
+	// The registry resolver is not required to accept an AbortSignal. Race it
+	// against both lifecycle cancellation and a hard bound. Resolver failures are
+	// deliberately converted to the native-compaction fallback, and the finally
+	// block also cleans up when the race itself rejects or is cancelled.
+	const pending = Promise.resolve().then(async () => {
+		if (signal?.aborted) return undefined;
+		try {
+			return await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		} catch {
+			return undefined;
+		}
+	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
+	const cancelled = new Promise<undefined>((resolve) => {
+		onAbort = () => resolve(undefined);
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+	});
+	const timeout = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => resolve(undefined), AUTH_RESOLUTION_TIMEOUT_MS);
+	});
+	try {
+		const resolved = await Promise.race([pending, cancelled, timeout]);
+		if (signal?.aborted || !resolved?.ok || !resolved.apiKey) return undefined;
+		if (
+			resolved.baseUrl !== undefined &&
+			resolved.baseUrl.replace(/\/+$/, "") !== CODEX_BASE_URL
+		)
+			return undefined;
+		const accountId = accountIdFromToken(resolved.apiKey);
+		if (!accountId) return undefined;
+		const headers = stringHeaders(resolved.headers);
+		return {
+			apiKey: resolved.apiKey,
+			accountId,
+			fingerprint: accountFingerprint(accountId),
+			...(headers ? { headers } : {}),
+			...(resolved.env ? { env: resolved.env } : {}),
+		};
+	} finally {
+		if (timer) clearTimeout(timer);
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+	}
 }
 
 function checkpointCompatible(
@@ -153,9 +187,39 @@ function tailIsCompatible(
 	compactionEntry: unknown,
 	model: Model<Api>,
 ): boolean {
+	if (!isRecord(compactionEntry)) return false;
 	const index = branch.indexOf(compactionEntry);
-	if (index < 0) return false;
-	for (const entry of branch.slice(index + 1)) {
+	const id = compactionEntry.id;
+	const firstKeptEntryId = compactionEntry.firstKeptEntryId;
+	if (
+		index < 0 ||
+		typeof id !== "string" ||
+		typeof firstKeptEntryId !== "string"
+	)
+		return false;
+	const compactionIdMatches = branch.filter(
+		(entry) => isRecord(entry) && entry.id === id,
+	);
+	const firstKeptMatches = branch.filter(
+		(entry) => isRecord(entry) && entry.id === firstKeptEntryId,
+	);
+	const firstKeptIndex = branch.findIndex(
+		(entry) => isRecord(entry) && entry.id === firstKeptEntryId,
+	);
+	// Pi uses the compaction's own ID for retain-none compactions, so equality
+	// is valid; duplicate boundary IDs are not.
+	if (
+		compactionIdMatches.length !== 1 ||
+		firstKeptMatches.length !== 1 ||
+		firstKeptIndex < 0 ||
+		firstKeptIndex > index
+	)
+		return false;
+	const retainedAndTail = [
+		...branch.slice(firstKeptIndex, index),
+		...branch.slice(index + 1),
+	];
+	for (const entry of retainedAndTail) {
 		if (
 			!isRecord(entry) ||
 			entry.type !== "message" ||
@@ -176,8 +240,11 @@ function tailIsCompatible(
 export interface CodexCompactionDependencies {
 	fetch?: typeof fetch;
 	timeoutMs?: number;
+	remoteGraceMs?: number;
 	nativeCompact?: typeof compact;
 }
+
+const DEFAULT_REMOTE_GRACE_MS = 5_000;
 
 export function createCodexCompactionExtension(
 	dependencies: CodexCompactionDependencies = {},
@@ -196,8 +263,8 @@ export function createCodexCompactionExtension(
 			if (event.customInstructions !== undefined) return;
 			const model = ctx.model;
 			if (!model) return;
-			const auth = await identity(ctx, model);
-			if (!auth) return;
+			const auth = await identity(ctx, model, event.signal);
+			if (event.signal.aborted || !auth) return;
 
 			// A previous readable summary without a usable opaque checkpoint means that
 			// remote compaction would silently forget already-discarded history.
@@ -223,6 +290,10 @@ export function createCodexCompactionExtension(
 			if (discarded.length === 0) return;
 
 			suppressReplay += 1;
+			const remoteController = new AbortController();
+			const abortRemote = () => remoteController.abort(event.signal.reason);
+			if (event.signal.aborted) abortRemote();
+			else event.signal.addEventListener("abort", abortRemote, { once: true });
 			try {
 				const nativePromise = runNativeCompact(
 					nativePreparation,
@@ -250,7 +321,7 @@ export function createCodexCompactionExtension(
 						discarded,
 						auth.apiKey,
 						{
-							signal: event.signal,
+							signal: remoteController.signal,
 							systemPrompt: ctx.getSystemPrompt(),
 							tools,
 							...(ctx.thinkingLevel && ctx.thinkingLevel !== "off"
@@ -267,21 +338,63 @@ export function createCodexCompactionExtension(
 						remoteInput,
 						{ accessToken: auth.apiKey, accountId: auth.accountId },
 						{
+							...(auth.headers ? { headers: auth.headers } : {}),
 							...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
 							...(dependencies.timeoutMs !== undefined
 								? { timeoutMs: dependencies.timeoutMs }
 								: {}),
-							signal: event.signal,
+							signal: remoteController.signal,
 						},
 					);
 					return item;
 				})();
-				const [native, remote] = await Promise.allSettled([
-					nativePromise,
-					remotePromise,
+				const settledRemotePromise = remotePromise.then(
+					(value) => ({ status: "fulfilled" as const, value }),
+					(reason: unknown) => ({ status: "rejected" as const, reason }),
+				);
+				const native = await Promise.allSettled([nativePromise]).then(
+					([result]) => result,
+				);
+				if (event.signal.aborted || native.status !== "fulfilled") {
+					remoteController.abort(event.signal.reason);
+					void remotePromise.catch(() => undefined);
+					return;
+				}
+				const graceMs = dependencies.remoteGraceMs ?? DEFAULT_REMOTE_GRACE_MS;
+				if (
+					!Number.isFinite(graceMs) ||
+					!Number.isInteger(graceMs) ||
+					graceMs < 0 ||
+					graceMs > 60_000
+				) {
+					remoteController.abort(
+						new RangeError("remoteGraceMs must be an integer from 0 to 60000"),
+					);
+					void remotePromise.catch(() => undefined);
+					return { compaction: native.value };
+				}
+				let graceTimer: ReturnType<typeof setTimeout> | undefined;
+				const remote = await Promise.race([
+					settledRemotePromise,
+					new Promise<{ status: "timeout" }>((resolve) => {
+						graceTimer = setTimeout(
+							() => resolve({ status: "timeout" }),
+							graceMs,
+						);
+					}),
 				]);
-				if (event.signal.aborted || native.status !== "fulfilled") return;
-				if (remote.status !== "fulfilled") return { compaction: native.value };
+				if (graceTimer) clearTimeout(graceTimer);
+				if (event.signal.aborted) return;
+				if (remote.status !== "fulfilled") {
+					remoteController.abort(
+						new DOMException(
+							"Remote compaction grace period elapsed",
+							"TimeoutError",
+						),
+					);
+					void remotePromise.catch(() => undefined);
+					return { compaction: native.value };
+				}
 				return {
 					compaction: {
 						...native.value,
@@ -301,6 +414,7 @@ export function createCodexCompactionExtension(
 					},
 				};
 			} finally {
+				event.signal.removeEventListener("abort", abortRemote);
 				suppressReplay -= 1;
 			}
 		});
@@ -321,6 +435,7 @@ export function createCodexCompactionExtension(
 			// checkpoint is a hard replay boundary.
 			if (parsed.state !== "valid" || !tailIsCompatible(branch, entry, model))
 				return;
+			if (event.payload.model !== model.id) return;
 			const auth = await identity(ctx, model);
 			if (
 				!auth ||

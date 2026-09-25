@@ -11,6 +11,16 @@ import { TOOL_DESCRIPTION } from "../src/search.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
 function harness(options: {
 	credential: () => Record<string, unknown> | undefined;
 	token?: () => Promise<string | undefined>;
@@ -133,6 +143,34 @@ test("fresh signed-out provider payload has neither schema nor research instruct
 	);
 });
 
+test("credential loss from a tool call is recovered by a later availability check", async () => {
+	let credential: Record<string, unknown> | undefined = {
+		type: "oauth",
+		accountId: "account",
+	};
+	const runtime = harness({ credential: () => credential });
+	await runtime.emit("session_start");
+	const tool = runtime.tools.get("research");
+	assert.ok(tool);
+
+	credential = undefined;
+	await assert.rejects(
+		tool.execute(
+			"signed-out",
+			{ query: "q" },
+			undefined,
+			undefined,
+			runtime.ctx,
+		),
+		/sign in with \/login openai-codex/,
+	);
+	assert.equal(runtime.active().includes("research"), false);
+
+	credential = { type: "oauth", accountId: "account" };
+	await runtime.emit("before_agent_start");
+	assert.equal(runtime.active().includes("research"), true);
+});
+
 test("login refresh registers the schema; logout removes it from subsequent payloads", async () => {
 	let credential: Record<string, unknown> | undefined;
 	const runtime = harness({ credential: () => credential });
@@ -160,14 +198,10 @@ test("login refresh registers the schema; logout removes it from subsequent payl
 
 	const stale = runtime.tools.get("research");
 	assert.ok(stale);
-	const result = await stale.execute(
-		"stale",
-		{ query: "q" },
-		undefined,
-		undefined,
-		runtime.ctx,
+	await assert.rejects(
+		stale.execute("stale", { query: "q" }, undefined, undefined, runtime.ctx),
+		/Research unavailable/,
 	);
-	assert.equal((result.details as { status: string }).status, "error");
 });
 
 test("ordinary checks preserve intentional user deactivation; explicit refresh enables", async () => {
@@ -197,13 +231,115 @@ test("backend denial deactivates until explicit refresh and preserves unrelated 
 	await runtime.emit("session_start");
 	const tool = runtime.tools.get("research");
 	assert.ok(tool);
-	await tool.execute("call", { query: "q" }, undefined, undefined, runtime.ctx);
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, undefined, undefined, runtime.ctx),
+		ResearchError,
+	);
 	assert.equal(runtime.active().includes("research"), false);
 	assert.ok(runtime.active().includes("other_tool"));
 	await runtime.emit("before_agent_start");
 	assert.equal(runtime.active().includes("research"), false);
 	await runtime.command("refresh");
 	assert.equal(runtime.active().includes("research"), true);
+});
+
+test("stale availability success cannot override a newer unavailable refresh", async () => {
+	const oldSelection = deferred<string>();
+	let selections = 0;
+	const client = {
+		invalidateModel() {},
+		selectModel: () => {
+			selections += 1;
+			return selections === 1
+				? oldSelection.promise
+				: Promise.reject(
+						new ResearchError("client_outdated", "outdated", false),
+					);
+		},
+		runResearch: async () => ({
+			answer: "answer",
+			citations: [],
+			model: "model",
+			searchActivity: 1,
+		}),
+	} as unknown as CodexClient;
+	const runtime = harness({
+		credential: () => ({ type: "oauth", accountId: "account" }),
+		client,
+	});
+	const initialCheck = runtime.emit("session_start");
+	while (selections < 1) await new Promise((resolve) => setImmediate(resolve));
+	await runtime.command("refresh");
+	assert.equal(runtime.active().includes("research"), false);
+	oldSelection.resolve("model");
+	await initialCheck;
+	assert.equal(runtime.active().includes("research"), false);
+});
+
+test("a newer availability check aborts and cleans up its predecessor", async () => {
+	const oldSelection = deferred<string>();
+	let selections = 0;
+	let oldSignal: AbortSignal | undefined;
+	const client = {
+		invalidateModel() {},
+		selectModel: (_auth: unknown, signal?: AbortSignal) => {
+			selections += 1;
+			if (selections === 1) {
+				oldSignal = signal;
+				return oldSelection.promise;
+			}
+			return Promise.resolve("model");
+		},
+		runResearch: async () => ({
+			answer: "answer",
+			citations: [],
+			model: "model",
+			searchActivity: 1,
+		}),
+	} as unknown as CodexClient;
+	const runtime = harness({
+		credential: () => ({ type: "oauth", accountId: "account" }),
+		client,
+	});
+	const initialCheck = runtime.emit("session_start");
+	while (!oldSignal) await new Promise((resolve) => setImmediate(resolve));
+
+	await runtime.command("refresh");
+	assert.equal(oldSignal.aborted, true);
+	oldSelection.resolve("stale-model");
+	await initialCheck;
+	assert.equal(runtime.active().includes("research"), true);
+});
+
+test("session shutdown aborts and cleans up an active availability check", async () => {
+	const selection = deferred<string>();
+	let signal: AbortSignal | undefined;
+	const client = {
+		invalidateModel() {},
+		selectModel: (_auth: unknown, selectionSignal?: AbortSignal) => {
+			signal = selectionSignal;
+			return selection.promise;
+		},
+		runResearch: async () => ({
+			answer: "answer",
+			citations: [],
+			model: "model",
+			searchActivity: 1,
+		}),
+	} as unknown as CodexClient;
+	const runtime = harness({
+		credential: () => ({ type: "oauth", accountId: "account" }),
+		client,
+	});
+	const initialCheck = runtime.emit("session_start");
+	while (!signal) await new Promise((resolve) => setImmediate(resolve));
+
+	await runtime.emit("session_shutdown");
+	assert.equal(signal.aborted, true);
+	selection.resolve("stale-model");
+	await initialCheck;
+	assert.equal(runtime.tools.has("research"), false);
+	assert.equal(runtime.active().includes("research"), false);
 });
 
 test("availability requires a usable backend catalog before registering", async () => {
@@ -260,6 +396,69 @@ test("explicit refresh invalidates and rechecks the backend catalog", async () =
 	assert.equal(invalidations, 1);
 	assert.equal(probes, 2);
 	assert.equal(runtime.active().includes("research"), true);
+});
+
+test("an old runResearch denial cannot disable a tool after refresh", async () => {
+	const oldRun = deferred<{
+		answer: string;
+		citations: [];
+		model: string;
+		searchActivity: number;
+	}>();
+	let runs = 0;
+	const client = {
+		invalidateModel() {},
+		selectModel: async () => "model",
+		runResearch: () => {
+			runs += 1;
+			return oldRun.promise;
+		},
+	} as unknown as CodexClient;
+	const runtime = harness({
+		credential: () => ({ type: "oauth", accountId: "account" }),
+		client,
+	});
+	await runtime.emit("session_start");
+	const tool = runtime.tools.get("research");
+	assert.ok(tool);
+	const execution = tool.execute(
+		"old",
+		{ query: "q" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	while (runs < 1) await new Promise((resolve) => setImmediate(resolve));
+	await runtime.command("refresh");
+	oldRun.reject(new ResearchError("access_denied", "denied", false));
+	await assert.rejects(execution, ResearchError);
+	assert.equal(runtime.active().includes("research"), true);
+});
+
+test("a new runResearch denial after refresh disables the tool", async () => {
+	let runs = 0;
+	const client = {
+		invalidateModel() {},
+		selectModel: async () => "model",
+		runResearch: async () => {
+			runs += 1;
+			throw new ResearchError("access_denied", "denied", false);
+		},
+	} as unknown as CodexClient;
+	const runtime = harness({
+		credential: () => ({ type: "oauth", accountId: "account" }),
+		client,
+	});
+	await runtime.emit("session_start");
+	await runtime.command("refresh");
+	const tool = runtime.tools.get("research");
+	assert.ok(tool);
+	await assert.rejects(
+		tool.execute("new", { query: "q" }, undefined, undefined, runtime.ctx),
+		ResearchError,
+	);
+	assert.equal(runs, 1);
+	assert.equal(runtime.active().includes("research"), false);
 });
 
 test("reload starts from fresh availability and unsupported Pi fails closed", async () => {

@@ -115,56 +115,64 @@ const findMarkupEnd = (value: string, start: number): number => {
 };
 
 const minifyXml = (value: string): string | undefined => {
-	const output: string[] = [];
 	let position = 0;
-
 	while (position < value.length) {
 		const markupStart = value.indexOf("<", position);
-		if (markupStart === -1) {
-			output.push(value.slice(position));
-			break;
-		}
-
-		output.push(value.slice(position, markupStart));
+		if (markupStart === -1) break;
 		const markupEnd = findMarkupEnd(value, markupStart);
-		if (markupEnd === -1) {
-			return undefined;
-		}
-
-		output.push(value.slice(markupStart, markupEnd));
+		if (markupEnd === -1) return undefined;
 		position = markupEnd;
 	}
+	// Without a schema, even whitespace-only text between empty elements may
+	// be significant. Only trim outside the document; preserve all inner text.
+	return value.trim();
+};
 
-	return output
-		.map((part, index) => {
-			if (
-				/^\s+$/.test(part) &&
-				output[index - 1]?.startsWith("<") &&
-				output[index + 1]?.startsWith("<")
-			) {
-				return "";
-			}
-			return part;
-		})
-		.join("")
-		.trim();
+// Validate with the native parser, but never serialize its (potentially rounded)
+// values. Removing only whitespace outside strings preserves every JSON lexeme.
+const minifyJson = (value: string): string | undefined => {
+	try {
+		JSON.parse(value);
+	} catch {
+		return undefined;
+	}
+	const chunks: string[] = [];
+	let start = 0;
+	let inString = false;
+	let escaped = false;
+	for (let index = 0; index < value.length; index++) {
+		const character = value[index];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (character === "\\") escaped = true;
+			else if (character === '"') inString = false;
+		} else if (character === '"') {
+			inString = true;
+		} else if (
+			character === " " ||
+			character === "\t" ||
+			character === "\r" ||
+			character === "\n"
+		) {
+			if (index > start) chunks.push(value.slice(start, index));
+			start = index + 1;
+		}
+	}
+	chunks.push(value.slice(start));
+	return chunks.join("");
 };
 
 const minifyNdjson = (value: string): string | undefined => {
 	const lines = value.split(/\r?\n/);
 	const minifiedLines: string[] = [];
-
-	try {
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (trimmed) {
-				minifiedLines.push(JSON.stringify(JSON.parse(trimmed)));
-			}
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed) {
+			const minified = minifyJson(trimmed);
+			if (minified === undefined) return undefined;
+			minifiedLines.push(minified);
 		}
-	} catch {
-		return undefined;
 	}
-
 	return minifiedLines.length > 0 ? minifiedLines.join("\n") : undefined;
 };
 
@@ -341,11 +349,9 @@ export const minifyText = (
 		trimmed.startsWith("{") ||
 		trimmed.startsWith("[")
 	) {
-		try {
-			const minified = JSON.stringify(JSON.parse(trimmed));
+		const minified = minifyJson(trimmed);
+		if (minified !== undefined) {
 			return { content: minified, minified: minified.length < content.length };
-		} catch {
-			// The response only looked like JSON. Try another supported format below.
 		}
 	}
 

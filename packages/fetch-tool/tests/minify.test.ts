@@ -3,6 +3,83 @@ import { describe, it } from "node:test";
 import { minifyText } from "../src/minify.ts";
 
 describe("minifyText", () => {
+	it("preserves JSON numeric lexemes and duplicate keys", () => {
+		const input = '{ "n": 9007199254740993, "n": -0, "e": 1e+20 }';
+		assert.equal(
+			minifyText(input, "application/json").content,
+			'{"n":9007199254740993,"n":-0,"e":1e+20}',
+		);
+	});
+
+	it("preserves whitespace in XML mixed content", () => {
+		assert.equal(
+			minifyText("<root><p>Hello <b>world</b> !</p></root>", "application/xml")
+				.content,
+			"<root><p>Hello <b>world</b> !</p></root>",
+		);
+		assert.equal(
+			minifyText("<p><b>one</b> <i>two</i></p>", "application/xml").content,
+			"<p><b>one</b> <i>two</i></p>",
+		);
+		assert.equal(
+			minifyText('<p xml:space="preserve"> <b>one</b> </p>', "application/xml")
+				.content,
+			'<p xml:space="preserve"> <b>one</b> </p>',
+		);
+	});
+	it("preserves whitespace-only XML nodes, including empty siblings", () => {
+		for (const xml of [
+			"<p><br/> <br/></p>",
+			'<p xml:space="preserve"> </p>',
+			"<p> <b>one</b> </p>",
+			"<root>\n  <child/>\n</root>",
+		]) {
+			assert.equal(minifyText(xml, "application/xml").content, xml);
+		}
+	});
+
+	it("preserves JSON string escapes and NDJSON number spelling", () => {
+		const object = {
+			text: 'spaces  and "quotes" \\ slash\nnewline',
+			nested: [null, true],
+		};
+		assert.equal(
+			minifyText(JSON.stringify(object, null, 2), "application/json").content,
+			JSON.stringify(object),
+		);
+		assert.equal(
+			minifyText(
+				'{ "id": 9007199254740993 }\n{ "n": -0, "e": 1e+400 }',
+				"application/ndjson",
+			).content,
+			'{"id":9007199254740993}\n{"n":-0,"e":1e+400}',
+		);
+	});
+
+	it("leaves invalid JSON grammar unchanged", () => {
+		for (const content of [
+			'{ "a": 1, }',
+			"[ 1, ]",
+			"{ 1: true }",
+			'{ "a":\u00a01 }',
+		]) {
+			assert.deepEqual(minifyText(content, "application/json"), {
+				content,
+				minified: false,
+			});
+		}
+	});
+
+	it("handles long strings and deeply nested JSON without recursive scanning", () => {
+		const content = JSON.stringify({ value: "a".repeat(8_000_000) });
+		assert.equal(minifyText(content, "application/json").content, content);
+		const nested = `${"[".repeat(10_000)} 0 ${"]".repeat(10_000)}`;
+		assert.equal(
+			minifyText(nested, "application/json").content,
+			nested.replaceAll(" ", ""),
+		);
+	});
+
 	it("minifies JSON from its content type", () => {
 		assert.deepEqual(
 			minifyText('{ "items": [1, 2] }', "application/json; charset=utf-8"),
@@ -27,10 +104,7 @@ describe("minifyText", () => {
 </root>
 `;
 
-		assert.equal(
-			minifyText(xml, "application/atom+xml").content,
-			'<?xml version="1.0"?><root><child comparison="> <">value</child><![CDATA[a < b]]></root>',
-		);
+		assert.equal(minifyText(xml, "application/atom+xml").content, xml.trim());
 	});
 
 	it("minifies NDJSON one record at a time", () => {
@@ -227,10 +301,7 @@ describe("minifyText", () => {
 </note>
 `;
 
-		assert.equal(
-			minifyText(xml, "text/xml").content,
-			"<!DOCTYPE note [\n  <!ELEMENT note (#PCDATA)>\n]><note><empty /><message>Hello <b>world</b> again</message></note>",
-		);
+		assert.equal(minifyText(xml, "text/xml").content, xml.trim());
 	});
 
 	it("leaves unterminated XML and HTML markup unchanged", () => {
@@ -243,6 +314,14 @@ describe("minifyText", () => {
 				minified: false,
 			});
 		}
+	});
+
+	it("rejects invalid JSON escapes instead of partially minifying", () => {
+		const input = '{ "value": "bad\\q" }';
+		assert.deepEqual(minifyText(input, "application/json"), {
+			content: input,
+			minified: false,
+		});
 	});
 
 	it("handles JSON primitives and already compact JSON", () => {

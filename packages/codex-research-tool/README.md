@@ -102,7 +102,7 @@ Account identity resolution uses this order:
 
 Both the refreshed bearer token and account ID are required. Pi's nonempty stored `accountId` is authoritative, so an opaque access token is accepted when that metadata is present; malformed token metadata fails closed when the stored account ID is absent. Missing credentials, API-key credentials, refresh failure, unstable account switching, and timeout also fail closed.
 
-Pi 0.85.1 does not expose cancellation for its internal credential-refresh operation. The extension bounds its own wait and ignores late completion for availability changes, although Pi may finish its serialized refresh in the background.
+Pi 0.85.1 does not expose cancellation for its internal credential-refresh operation. The extension bounds its own wait and ignores late completion for availability changes, although Pi may finish its serialized refresh in the background. A permanently hung resolver remains tracked so refresh cannot launch overlapping work; reload or restart Pi to recover from that process-level hang.
 
 ### Research request
 
@@ -130,7 +130,7 @@ The model-catalog request sends an explicit Codex protocol compatibility version
 - 20,000-character maximum result text, with bounded answer metadata and an explicit truncation notice.
 - Redirects, 401, 403, 429, 5xx responses, empty or incompatible model catalogs, malformed SSE, failed/incomplete events, premature EOF, missing search activity, empty answers, and cancellation become sanitized structured errors.
 
-Pi 0.85.1's `AgentToolResult` type has no `isError` field. Failures therefore use model-visible `Status: error` content and `details.status: "error"` with a structured error object; they are not formatted as ordinary answers.
+Pi marks thrown `execute()` failures as tool errors. This extension deliberately throws sanitized `ResearchError` instances (rather than returning a normal result that merely says `Status: error`), preserving Pi's actual failure semantics. Error codes and retryability remain available on the thrown error for callers and logs; failure details are not fabricated because Pi's executor does not support an error result with structured details.
 
 ## Security and privacy
 

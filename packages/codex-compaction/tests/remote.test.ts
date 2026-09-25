@@ -81,6 +81,12 @@ test("sends trailing trigger, required beta, and accepts exactly one completed c
 		[{ type: "message", role: "user", content: [] }],
 		{ accessToken: token("acct"), accountId: "acct" },
 		{
+			headers: {
+				"X-Provider-Region": "custom",
+				Authorization: "evil",
+				Origin: "https://evil.example",
+				"X-API-Key": "stolen",
+			},
 			fetch: async (input, init) => {
 				assert.equal(input, CODEX_RESPONSES_URL);
 				request = init;
@@ -96,12 +102,88 @@ test("sends trailing trigger, required beta, and accepts exactly one completed c
 	const headers = new Headers(request?.headers);
 	assert.equal(headers.get("x-codex-beta-features"), BETA_FEATURE);
 	assert.equal(headers.get("chatgpt-account-id"), "acct");
+	assert.equal(headers.get("x-provider-region"), "custom");
+	assert.equal(headers.get("authorization"), `Bearer ${token("acct")}`);
+	assert.equal(headers.get("origin"), null);
+	assert.equal(headers.get("x-api-key"), null);
 	const body = JSON.parse(String(request?.body)) as {
 		input: unknown[];
 		reasoning: unknown;
 	};
 	assert.deepEqual(body.input.at(-1), { type: "compaction_trigger" });
 	assert.deepEqual(body.reasoning, { effort: "low" });
+});
+
+test("abort promptly rejects fetches that ignore cancellation while awaiting headers", async () => {
+	const controller = new AbortController();
+	let started = false;
+	const request = requestRemoteCompaction(
+		{ model: model.id },
+		[],
+		{ accessToken: token("acct"), accountId: "acct" },
+		{
+			timeoutMs: 1_000,
+			signal: controller.signal,
+			fetch: async () => {
+				started = true;
+				return new Promise<Response>(() => {});
+			},
+		},
+	);
+	while (!started) await new Promise((resolve) => setTimeout(resolve, 0));
+	controller.abort(new DOMException("cancelled", "AbortError"));
+	await assert.rejects(request, { name: "AbortError" });
+});
+
+test("pre-aborted signal prevents starting fetch", async () => {
+	const controller = new AbortController();
+	controller.abort(new DOMException("cancelled", "AbortError"));
+	let called = false;
+	await assert.rejects(
+		requestRemoteCompaction(
+			{},
+			[],
+			{ accessToken: "x", accountId: "a" },
+			{
+				signal: controller.signal,
+				fetch: async () => {
+					called = true;
+					return new Response();
+				},
+			},
+		),
+	);
+	assert.equal(called, false);
+});
+
+test("cancels rejected HTTP response bodies", async () => {
+	let cancelled = false;
+	const body = new ReadableStream<Uint8Array>({
+		cancel() {
+			cancelled = true;
+		},
+	});
+	await assert.rejects(
+		requestRemoteCompaction(
+			{},
+			[],
+			{ accessToken: "x", accountId: "a" },
+			{ fetch: async () => new Response(body, { status: 500 }) },
+		),
+	);
+	assert.equal(cancelled, true);
+});
+
+test("rejects unbounded and non-finite timeout values", async () => {
+	for (const timeoutMs of [NaN, Infinity, 0, 601_000])
+		await assert.rejects(
+			requestRemoteCompaction(
+				{},
+				[],
+				{ accessToken: "x", accountId: "a" },
+				{ timeoutMs, fetch: fetch },
+			),
+		);
 });
 
 test("rejects redirects, malformed SSE, missing completion, and ambiguous checkpoints", async (t) => {
@@ -135,8 +217,9 @@ test("rejects redirects, malformed SSE, missing completion, and ambiguous checkp
 
 test("accepts item.done checkpoints, terminal duplication, split chunks, final frames, and cancels after completion", async () => {
 	const checkpoint = { type: "compaction", encrypted_content: "opaque" };
+	const reordered = { encrypted_content: "opaque", type: "compaction" };
 	const itemDone = `data: ${JSON.stringify({ type: "response.output_item.done", item: checkpoint })}\n\n`;
-	const completed = `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed" } })}`;
+	const completed = `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [reordered] } })}`;
 	let cancelled = false;
 	const stream = new ReadableStream<Uint8Array>({
 		start(controller) {
@@ -194,15 +277,16 @@ test("does not return a checkpoint when cancellation races terminal SSE", async 
 	const controller = new AbortController();
 	const terminal = `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [{ type: "compaction", encrypted_content: "opaque" }] } })}\n\n`;
 	let cancelled = false;
-	const stream = new ReadableStream<Uint8Array>({
-		start(streamController) {
-			streamController.enqueue(new TextEncoder().encode(terminal));
-			controller.abort(new DOMException("cancelled", "AbortError"));
-		},
-		cancel() {
-			cancelled = true;
-		},
-	});
+	const makeStream = () =>
+		new ReadableStream<Uint8Array>({
+			start(streamController) {
+				streamController.enqueue(new TextEncoder().encode(terminal));
+				controller.abort(new DOMException("cancelled", "AbortError"));
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
 	await assert.rejects(
 		requestRemoteCompaction(
 			{ model: model.id },
@@ -210,7 +294,7 @@ test("does not return a checkpoint when cancellation races terminal SSE", async 
 			{ accessToken: token("acct"), accountId: "acct" },
 			{
 				signal: controller.signal,
-				fetch: async () => new Response(stream, { status: 200 }),
+				fetch: async () => new Response(makeStream(), { status: 200 }),
 			},
 		),
 	);

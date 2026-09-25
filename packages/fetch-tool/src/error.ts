@@ -11,21 +11,6 @@ interface ToolErrorDetails {
 	actualSize?: number | undefined;
 }
 
-export const buildErrorResponse = (
-	message: string,
-	details: ToolErrorDetails,
-) => {
-	return {
-		content: [
-			{
-				type: "text" as const,
-				text: message,
-			},
-		],
-		details,
-	};
-};
-
 export const normalizeError = (
 	error: unknown,
 	url: string,
@@ -55,8 +40,20 @@ export const normalizeError = (
 		};
 	}
 
+	if (abortCause) {
+		return {
+			errorType: abortCause === "timeout" ? "timeout" : "aborted",
+			message:
+				abortCause === "timeout" && timeout
+					? `Request timed out after ${timeout}ms`
+					: "Request aborted",
+			url,
+			timeout,
+		};
+	}
+
 	if (error instanceof Error) {
-		if (error.name === "AbortError" || abortCause) {
+		if (error.name === "AbortError") {
 			return {
 				errorType: abortCause === "timeout" ? "timeout" : "aborted",
 				message:

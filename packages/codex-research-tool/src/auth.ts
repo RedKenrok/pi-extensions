@@ -107,6 +107,7 @@ async function withAbort<T>(
 
 export class AuthAdapter {
 	private inFlight: Promise<AuthResult> | undefined;
+	private readonly pendingRefreshes = new Set<Promise<unknown>>();
 	private disposed = false;
 	private readonly dependencies: AuthDependencies;
 
@@ -118,15 +119,31 @@ export class AuthAdapter {
 		this.disposed = true;
 	}
 
+	/**
+	 * Invalidate only an idle result. An active flight may still be before its
+	 * refresh phase, so never abandon it in favor of a duplicate operation.
+	 */
+	invalidate(): void {
+		if (this.inFlight) return;
+		this.inFlight = undefined;
+	}
+
 	check(options: AuthCheckOptions = {}): Promise<AuthResult> {
 		if (this.disposed || options.signal?.aborted) {
 			return Promise.resolve(abortResult());
 		}
-		this.inFlight ??= this.runBounded(options.timeoutMs ?? 5_000).finally(
-			() => {
-				this.inFlight = undefined;
-			},
-		);
+		if (!this.inFlight) {
+			const operation = this.runBounded(options.timeoutMs ?? 5_000);
+			this.inFlight = operation;
+			void operation.then(async () => {
+				while (this.pendingRefreshes.size > 0) {
+					await Promise.allSettled([...this.pendingRefreshes]);
+				}
+				if (this.inFlight === operation) {
+					this.inFlight = undefined;
+				}
+			});
+		}
 		return this.waitForCaller(this.inFlight, options.signal);
 	}
 
@@ -171,9 +188,15 @@ export class AuthAdapter {
 
 			let token: string | undefined;
 			try {
-				token = nonemptyString(
-					await withAbort(this.dependencies.resolveAccessToken(signal), signal),
+				const refresh = Promise.resolve(
+					this.dependencies.resolveAccessToken(signal),
 				);
+				this.pendingRefreshes.add(refresh);
+				void refresh.then(
+					() => this.pendingRefreshes.delete(refresh),
+					() => this.pendingRefreshes.delete(refresh),
+				);
+				token = nonemptyString(await withAbort(refresh, signal));
 			} catch {
 				if (signal.aborted) return unavailable("check_timeout");
 				return unavailable("refresh_failed");

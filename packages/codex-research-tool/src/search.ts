@@ -168,10 +168,10 @@ export function formatSuccess(
 		sourceChars += line.length + 1;
 	}
 	let answer = applyCitationMarkers(
-		result.answer.trim(),
+		result.answer,
 		result.citations,
 		renderedSources,
-	);
+	).trim();
 	const status = renderedSources.length > 0 ? "ok" : "uncited";
 	const warning =
 		status === "uncited"
@@ -216,42 +216,6 @@ export function formatSuccess(
 			...(result.responseId ? { responseId: result.responseId } : {}),
 			elapsedMs,
 			truncated,
-		},
-	};
-}
-
-export function formatError(
-	query: string,
-	error: ResearchError,
-	elapsedMs: number,
-	disabled: boolean,
-): AgentToolResult<ResearchDetails> {
-	const retryAfter = error.retryAfterSeconds
-		? ` Retry after about ${error.retryAfterSeconds} seconds.`
-		: "";
-	const disabledText = disabled
-		? error.code === "client_outdated"
-			? "\nThe tool has been disabled. Update codex-research-tool, then run /research refresh."
-			: "\nThe tool has been disabled. Do not retry until authentication, access, or backend compatibility is restored with /research refresh."
-		: "";
-	const text = `Status: error\nCode: ${error.code}\n${error.message}${retryAfter}${disabledText}`;
-	return {
-		content: [{ type: "text", text }],
-		details: {
-			status: "error",
-			query,
-			sources: [],
-			elapsedMs,
-			truncated: false,
-			error: {
-				code: error.code,
-				message: error.message,
-				retryable: error.retryable,
-				...(error.retryAfterSeconds !== undefined
-					? { retryAfterSeconds: error.retryAfterSeconds }
-					: {}),
-				...(error.modelOptions ? { modelOptions: error.modelOptions } : {}),
-			},
 		},
 	};
 }
@@ -329,16 +293,11 @@ export function createResearchTool(
 			const requestedEffort =
 				typeof params.effort === "string" ? params.effort.trim() : undefined;
 			if (!query || query.length > 4000) {
-				return formatError(
-					query,
-					new ResearchError(
-						"invalid_input",
-						query
-							? "The research query exceeds 4,000 characters."
-							: "The research query is empty.",
-						false,
-					),
-					now() - started,
+				throw new ResearchError(
+					"invalid_input",
+					query
+						? "The research query exceeds 4,000 characters."
+						: "The research query is empty.",
 					false,
 				);
 			}
@@ -346,14 +305,9 @@ export function createResearchTool(
 				params.model !== undefined &&
 				(!requestedModel || requestedModel.length > 128)
 			) {
-				return formatError(
-					query,
-					new ResearchError(
-						"invalid_input",
-						"The research model must be a non-empty model ID of at most 128 characters.",
-						false,
-					),
-					now() - started,
+				throw new ResearchError(
+					"invalid_input",
+					"The research model must be a non-empty model ID of at most 128 characters.",
 					false,
 				);
 			}
@@ -361,14 +315,9 @@ export function createResearchTool(
 				params.effort !== undefined &&
 				(!requestedEffort || requestedEffort.length > 32)
 			) {
-				return formatError(
-					query,
-					new ResearchError(
-						"invalid_input",
-						"The research effort must be a non-empty reasoning level of at most 32 characters.",
-						false,
-					),
-					now() - started,
+				throw new ResearchError(
+					"invalid_input",
+					"The research effort must be a non-empty reasoning level of at most 32 characters.",
 					false,
 				);
 			}
@@ -378,6 +327,19 @@ export function createResearchTool(
 				dependencies.runtimeSignal,
 			);
 			try {
+				if (deadline.signal.aborted) {
+					throw new ResearchError(
+						deadline.signal.reason instanceof Error &&
+							deadline.signal.reason.name === "TimeoutError"
+							? "timeout"
+							: "cancelled",
+						deadline.signal.reason instanceof Error &&
+							deadline.signal.reason.name === "TimeoutError"
+							? "Research timed out after 10 minutes."
+							: "Research was cancelled.",
+						false,
+					);
+				}
 				onUpdate?.({
 					content: [{ type: "text", text: `Research: ${query}\n\nSearching…` }],
 					details: {
@@ -390,13 +352,38 @@ export function createResearchTool(
 				});
 				const auth = await dependencies.authCheck(deadline.signal);
 				if (auth.kind !== "ready") {
+					if (deadline.signal.aborted) {
+						throw new ResearchError(
+							deadline.signal.reason instanceof Error &&
+								deadline.signal.reason.name === "TimeoutError"
+								? "timeout"
+								: "cancelled",
+							deadline.signal.reason instanceof Error &&
+								deadline.signal.reason.name === "TimeoutError"
+								? "Research timed out after 10 minutes."
+								: "Research was cancelled.",
+							false,
+						);
+					}
+					if (auth.reason === "check_timeout") {
+						throw new ResearchError(
+							"timeout",
+							"Research timed out after 10 minutes.",
+							false,
+						);
+					}
 					dependencies.onUnavailable("credentials", "auth_required");
-					return formatError(
-						query,
-						unavailableError(auth),
-						now() - started,
-						true,
-					);
+					throw unavailableError(auth);
+				}
+				if (deadline.signal.aborted) {
+					throw deadline.signal.reason instanceof Error &&
+						deadline.signal.reason.name === "TimeoutError"
+						? new ResearchError(
+								"timeout",
+								"Research timed out after 10 minutes.",
+								false,
+							)
+						: new ResearchError("cancelled", "Research was cancelled.", false);
 				}
 				const model = await dependencies.client.selectModel(
 					auth,
@@ -431,29 +418,28 @@ export function createResearchTool(
 				});
 				return formatSuccess(query, result, now() - started);
 			} catch (cause) {
-				const error =
-					cause instanceof ResearchError
+				const error = deadline.signal.aborted
+					? new ResearchError(
+							deadline.signal.reason instanceof Error &&
+								deadline.signal.reason.name === "TimeoutError"
+								? "timeout"
+								: "cancelled",
+							deadline.signal.reason instanceof Error &&
+								deadline.signal.reason.name === "TimeoutError"
+								? "Research timed out after 10 minutes."
+								: "Research was cancelled.",
+							false,
+						)
+					: cause instanceof ResearchError
 						? cause
-						: deadline.signal.aborted
-							? new ResearchError(
-									deadline.signal.reason instanceof Error &&
-										deadline.signal.reason.name === "TimeoutError"
-										? "timeout"
-										: "cancelled",
-									deadline.signal.reason instanceof Error &&
-										deadline.signal.reason.name === "TimeoutError"
-										? "Research timed out after 10 minutes."
-										: "Research was cancelled.",
-									false,
-								)
-							: new ResearchError(
-									"network",
-									"Codex research could not reach the backend.",
-									true,
-								);
+						: new ResearchError(
+								"network",
+								"Codex research could not reach the backend.",
+								true,
+							);
 				const disabled = backendDisables(error.code);
 				if (disabled) dependencies.onUnavailable("backend", error.code);
-				return formatError(query, error, now() - started, disabled);
+				throw error;
 			} finally {
 				deadline.cleanup();
 			}

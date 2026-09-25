@@ -56,15 +56,17 @@ Send JSON and include all response headers:
 | `redirect` | `follow` | `follow`, `error`, or `manual`. |
 | `includeHeaders` | `safe` | `safe`, `all`, or `none`; booleans alias `all` and `none`. |
 
-Caller cancellation is reported separately from timeout. HTML conversion removes common navigation, forms, advertising, cookie UI, social UI, scripts, and styles; favors semantic article/main containers; and resolves relative links against the final response URL. Declared HTTP and HTML character encodings are honored when supported.
+Caller cancellation is reported separately from timeout, and validation and operational failures are thrown as failed tool results. Deadlines are checked between synchronous decoding and transformation stages; JavaScript cannot interrupt an individual synchronous parser/minifier while it is running, so a single transform may exceed the deadline before the next check. HTML conversion removes common navigation, forms, advertising, cookie UI, social UI, scripts, and styles; favors semantic article/main containers; and resolves relative links against the final response URL. Declared HTTP and HTML character encodings are honored when supported.
 
 Ordinary responses may download up to 16 MiB. HTML and minifiable structured responses may download up to 32 MiB before transformation. Text output defaults to 512 KiB and returns a UTF-8-safe prefix with truncation metadata when larger. Binary responses expose metadata and a base64 preview of only the first 150 bytes.
+
+JSON and NDJSON minification preserves numeric spelling and string contents without rounding large integers. XML processing only trims document-edge whitespace: internal whitespace is preserved because it may be meaningful without a schema.
 
 The default safe-header mode includes common content, cache, redirect, and retry headers while omitting cookies and most diagnostic/security headers.
 
 ## Security and privacy
 
-- Requests go to the supplied URL and follow the selected redirect policy. Local and private-network services are reachable; do not expose the tool to untrusted callers when that access is unsafe.
+- Requests go to the supplied URL and follow the selected redirect policy (default `follow`). Network destinations are intentionally unrestricted: local and private-network services are reachable, including through redirects. Do not expose the tool to untrusted callers when that access is unsafe.
 - Caller-supplied headers and bodies can contain secrets and are forwarded to the selected destination. Full response-header mode can also expose sensitive values to model context.
 - Downloaded content is untrusted. Markdown conversion removes executable page elements but cannot remove textual prompt injection.
 - The package does not persist fetched content, credentials, or cookies and does not maintain a cookie jar.

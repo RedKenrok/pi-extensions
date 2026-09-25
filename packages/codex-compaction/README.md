@@ -12,7 +12,7 @@ Sign in through Pi first with `/login openai-codex`. The package registers no mo
 
 ## Behavior and fallback
 
-At `session_before_compact`, the extension asks the fixed `https://chatgpt.com` Codex endpoint to compact only Pi's discarded prefix (plus a compatible checkpoint from the previous compaction). Pi's kept tail is not sent as part of that prefix and remains unchanged. The opaque checkpoint is stored in `CompactionEntry.details` and substituted for Pi's generated summary input on later provider requests.
+At `session_before_compact`, the extension asks the fixed `https://chatgpt.com` Codex endpoint to compact Pi's discarded messages (plus a compatible checkpoint from the previous compaction). The request also includes the current system prompt and active tool schemas required by the Codex protocol; Pi's kept tail is not sent as conversation input and remains unchanged. The opaque checkpoint is stored in `CompactionEntry.details` and substituted for Pi's generated summary input on later provider requests.
 
 A native Pi summary is retained alongside the checkpoint so the session remains useful if this extension is disabled or the provider changes. Requests with custom compaction instructions use native compaction because the remote protocol cannot guarantee those instructions are honored. Authentication, endpoint, account, model, or checkpoint mismatches also use native compaction.
 
@@ -22,7 +22,7 @@ A native compaction entry without a compatible remote checkpoint is a permanent 
 
 ## Security and privacy
 
-The discarded conversation prefix is sent to the fixed `https://chatgpt.com/backend-api/codex` service using credentials resolved by Pi for `openai-codex`. Redirects are rejected so credentials are never forwarded to another origin. Checkpoints are opaque provider data and may contain conversation-derived information; they are persisted in the Pi session file under `CompactionEntry.details`.
+The discarded conversation messages, together with the required current system prompt and active tool schemas, are sent to the fixed `https://chatgpt.com/backend-api/codex` service using credentials resolved by Pi for `openai-codex`. Redirects are rejected so credentials are never forwarded to another origin. Checkpoints are opaque provider data and may contain conversation-derived information; they are persisted in the Pi session file under `CompactionEntry.details`.
 
 No project configuration can replace the trusted origin or inject credentials. As with normal Codex use, OpenAI's service terms and data handling apply.
 
@@ -30,7 +30,7 @@ No project configuration can replace the trusted origin or inject credentials. A
 
 Remote checkpoints are intended to retain Codex-native context that may not fit cleanly in a text summary, but they are experimental, opaque, and specific to one account, model, API, and endpoint. If replay cannot be proved safe, the extension leaves Pi's provider payload untouched.
 
-A successful hybrid compaction makes two requests: Pi's native summarization request and the Codex remote-compaction request. Both can consume service quota. Pi records the native summary's usage, but the experimental remote response does not currently expose/account usage in the `CompactionEntry`, so Pi session totals may under-report the remote request.
+A successful hybrid compaction makes two requests: Pi's native summarization request and the Codex remote-compaction request. Both can consume service quota. Pi records the native summary's usage, but the experimental remote request's usage is not accounted for in the `CompactionEntry`, so Pi session totals under-report it. By default, the extension waits up to 5 seconds after native compaction for the remote request; configure `remoteGraceMs` when creating the extension (integer 0–60000) to change this grace period. If remote work does not finish in time, native output is returned and the remote request is aborted.
 
 The extension stores and replays the single opaque compaction item returned by Codex rather than retaining an additional 64K slice of discarded user messages. Pi already preserves its independently selected kept tail, so retaining another slice would duplicate content and weaken Pi's boundary. On successive compactions, the prior opaque item seeds the next prefix-only request.
 

@@ -44,7 +44,12 @@ interface ReplayContext {
 	sessionManager: { getBranch(): unknown[] };
 }
 
-function setup(details: unknown, tail: unknown[] = []) {
+function setup(
+	details: unknown,
+	tail: unknown[] = [],
+	firstKeptEntryId = "compaction-1",
+	before: unknown[] = [],
+) {
 	let replay:
 		| ((event: { payload: unknown }, ctx: ReplayContext) => Promise<unknown>)
 		| undefined;
@@ -54,8 +59,14 @@ function setup(details: unknown, tail: unknown[] = []) {
 		},
 	} as unknown as ExtensionAPI;
 	createCodexCompactionExtension()(pi);
-	const compaction = { type: "compaction", summary: "readable", details };
-	const branch = [compaction, ...tail];
+	const compaction = {
+		type: "compaction",
+		id: "compaction-1",
+		firstKeptEntryId,
+		summary: "readable",
+		details,
+	};
+	const branch = [...before, compaction, ...tail];
 	const ctx = {
 		model,
 		modelRegistry: {
@@ -106,6 +117,7 @@ test("latest malformed checkpoint blocks replay and an incompatible tail blocks 
 		await malformed.replay(
 			{
 				payload: {
+					model: model.id,
 					input: [
 						{ role: "user", content: [{ type: "input_text", text: PREFIX }] },
 					],
@@ -130,12 +142,99 @@ test("latest malformed checkpoint blocks replay and an incompatible tail blocks 
 		await switched.replay(
 			{
 				payload: {
+					model: model.id,
 					input: [
 						{ role: "user", content: [{ type: "input_text", text: PREFIX }] },
 					],
 				},
 			},
 			switched.ctx,
+		),
+		undefined,
+	);
+});
+
+test("payload model must match the active model before replay", async () => {
+	const state = setup({ remoteCompaction: checkpoint });
+	const summary = {
+		role: "user",
+		content: [{ type: "input_text", text: `${PREFIX}readable\\n</summary>` }],
+	};
+	assert.equal(
+		await state.replay(
+			{ payload: { model: "other-model", input: [summary] } },
+			state.ctx,
+		),
+		undefined,
+	);
+});
+
+test("a retain-none compaction may use its own id as the kept boundary", async () => {
+	const state = setup({ remoteCompaction: checkpoint });
+	const result = (await state.replay(
+		{
+			payload: {
+				model: model.id,
+				input: [
+					{
+						role: "user",
+						content: [
+							{ type: "input_text", text: `${PREFIX}readable\n</summary>` },
+						],
+					},
+				],
+			},
+		},
+		state.ctx,
+	)) as Record<string, unknown>;
+	assert.deepEqual(result.input, [checkpoint.item]);
+});
+
+test("duplicate kept-boundary ids fail closed", async () => {
+	const duplicate = { type: "message", id: "kept-1" };
+	const state = setup({ remoteCompaction: checkpoint }, [], "kept-1", [
+		duplicate,
+		{ ...duplicate },
+	]);
+	assert.equal(
+		await state.replay(
+			{
+				payload: {
+					model: model.id,
+					input: [
+						{ role: "user", content: [{ type: "input_text", text: PREFIX }] },
+					],
+				},
+			},
+			state.ctx,
+		),
+		undefined,
+	);
+});
+
+test("retained entries before the compaction are part of replay validation", async () => {
+	const kept = {
+		type: "message",
+		id: "kept-1",
+		message: {
+			role: "assistant",
+			provider: "openai-codex",
+			api: "openai-codex-responses",
+			model: "other",
+		},
+	};
+	const state = setup({ remoteCompaction: checkpoint }, [], "kept-1", [kept]);
+	assert.equal(
+		await state.replay(
+			{
+				payload: {
+					model: model.id,
+					input: [
+						{ role: "user", content: [{ type: "input_text", text: PREFIX }] },
+					],
+				},
+			},
+			state.ctx,
 		),
 		undefined,
 	);
@@ -152,6 +251,7 @@ test("account mismatch and ambiguous summary matches leave payload untouched", a
 		await state.replay(
 			{
 				payload: {
+					model: model.id,
 					input: [
 						{ role: "user", content: [{ type: "input_text", text: PREFIX }] },
 					],
@@ -167,7 +267,10 @@ test("account mismatch and ambiguous summary matches leave payload untouched", a
 		content: [{ type: "input_text", text: `${PREFIX}readable\n</summary>` }],
 	};
 	assert.equal(
-		await valid.replay({ payload: { input: [summary, summary] } }, valid.ctx),
+		await valid.replay(
+			{ payload: { model: model.id, input: [summary, summary] } },
+			valid.ctx,
+		),
 		undefined,
 	);
 	const augmented = {
@@ -178,7 +281,10 @@ test("account mismatch and ambiguous summary matches leave payload untouched", a
 		],
 	};
 	assert.equal(
-		await valid.replay({ payload: { input: [augmented] } }, valid.ctx),
+		await valid.replay(
+			{ payload: { model: model.id, input: [augmented] } },
+			valid.ctx,
+		),
 		undefined,
 	);
 });

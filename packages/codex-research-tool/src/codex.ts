@@ -4,6 +4,7 @@ export const CODEX_ORIGIN = "https://chatgpt.com";
 export const CODEX_RESPONSES_URL = `${CODEX_ORIGIN}/backend-api/codex/responses`;
 export const CODEX_MODELS_URL = `${CODEX_ORIGIN}/backend-api/codex/models`;
 export const MAX_STREAM_BYTES = 2 * 1024 * 1024;
+export const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
 export const MAX_SSE_FRAME_BYTES = 256 * 1024;
 export const DEFAULT_RESEARCH_MODEL = "gpt-6-luna";
 // This identifies the Codex wire-protocol compatibility implemented here. It is
@@ -230,6 +231,12 @@ function httpError(
 	);
 }
 
+function cancelResponseBody(response: Response): void {
+	if (response.body && !response.body.locked) {
+		void response.body.cancel().catch(() => undefined);
+	}
+}
+
 function abortError(signal?: AbortSignal): ResearchError {
 	const reason = signal?.reason;
 	if (reason instanceof Error && reason.name === "TimeoutError") {
@@ -289,6 +296,7 @@ export async function* parseSse(
 		while (true) {
 			if (signal?.aborted) throw abortError(signal);
 			const { done, value } = await reader.read();
+			if (signal?.aborted) throw abortError(signal);
 			if (value) {
 				totalBytes += value.byteLength;
 				if (totalBytes > MAX_STREAM_BYTES) {
@@ -335,7 +343,7 @@ export async function* parseSse(
 		}
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
-		if (!completed) await reader.cancel().catch(() => undefined);
+		if (!completed) void reader.cancel().catch(() => undefined);
 		reader.releaseLock();
 	}
 }
@@ -455,15 +463,70 @@ function terminalError(data: Record<string, unknown>): ResearchError {
 		stringValue(top?.message) ??
 		stringValue(data.message) ??
 		"";
-	const combined = `${code} ${message}`.toLowerCase();
-	if (/auth|token|unauthor/.test(combined)) {
+	// Prefer explicit protocol codes. Unknown codes fail closed rather than
+	// allowing arbitrary server text to change availability policy.
+	const normalized = code.toLowerCase().replaceAll("-", "_");
+	if (
+		[
+			"server_error",
+			"internal_server_error",
+			"service_unavailable",
+			"server_unavailable",
+			"temporary_unavailable",
+			"unavailable",
+			"timeout",
+			"timeout_error",
+			"timed_out",
+			"request_timeout",
+			"connection_timeout",
+			"gateway_timeout",
+		].includes(normalized)
+	) {
+		return new ResearchError(
+			"network",
+			"Codex research is temporarily unavailable.",
+			true,
+		);
+	}
+	if (
+		[
+			"auth_error",
+			"authentication_error",
+			"unauthorized",
+			"token_expired",
+		].includes(normalized)
+	) {
 		return new ResearchError(
 			"auth_required",
 			"The Codex subscription rejected authentication. Sign in again with /login openai-codex, then run /research refresh.",
 			false,
 		);
 	}
-	if (/rate|quota|limit/.test(combined)) {
+	if (
+		["forbidden", "access_denied", "permission_denied"].includes(normalized)
+	) {
+		return new ResearchError(
+			"access_denied",
+			"Codex denied research access.",
+			false,
+		);
+	}
+	if (["rate_limit", "rate_limited", "quota_exceeded"].includes(normalized)) {
+		return new ResearchError(
+			"rate_limited",
+			"Codex research is rate limited.",
+			true,
+		);
+	}
+	const combined = `${normalized} ${message.toLowerCase()}`;
+	if (/\b(unauthori[sz]ed|authentication required)\b/.test(combined)) {
+		return new ResearchError(
+			"auth_required",
+			"The Codex subscription rejected authentication. Sign in again with /login openai-codex, then run /research refresh.",
+			false,
+		);
+	}
+	if (/\b(rate limit|quota exceeded)\b/.test(combined)) {
 		return new ResearchError(
 			"rate_limited",
 			"Codex research is rate limited.",
@@ -528,21 +591,66 @@ export class CodexClient {
 			throw normalizeThrown(error, signal);
 		}
 		if (response.status >= 300 && response.status < 400) {
+			cancelResponseBody(response);
 			throw new ResearchError(
 				"backend_incompatible",
 				"Codex model discovery attempted an unexpected redirect.",
 				false,
 			);
 		}
-		if (!response.ok) throw httpError(response, this.now(), "models");
+		if (!response.ok) {
+			cancelResponseBody(response);
+			throw httpError(response, this.now(), "models");
+		}
 		let payload: unknown;
 		try {
-			payload = await response.json();
-		} catch {
+			if (!response.body) throw new Error("missing body");
+			const reader = response.body.getReader();
+			const chunks: Uint8Array[] = [];
+			const abortRead = () => void reader.cancel().catch(() => undefined);
+			signal?.addEventListener("abort", abortRead, { once: true });
+			let size = 0;
+			try {
+				while (true) {
+					if (signal?.aborted) throw abortError(signal);
+					const { done, value } = await reader.read();
+					if (signal?.aborted) throw abortError(signal);
+					if (done) break;
+					if (value) {
+						size += value.byteLength;
+						if (size > MAX_CATALOG_BYTES) throw new Error("catalog too large");
+						chunks.push(value);
+					}
+				}
+			} finally {
+				signal?.removeEventListener("abort", abortRead);
+				void reader.cancel().catch(() => undefined);
+				reader.releaseLock();
+			}
+			const bytes = new Uint8Array(size);
+			let offset = 0;
+			for (const chunk of chunks) {
+				bytes.set(chunk, offset);
+				offset += chunk.byteLength;
+			}
+			payload = JSON.parse(new TextDecoder().decode(bytes));
+		} catch (cause) {
+			if (cause instanceof ResearchError) throw cause;
+			if (signal?.aborted) throw abortError(signal);
+			if (
+				cause instanceof SyntaxError ||
+				(cause instanceof Error && cause.message === "catalog too large")
+			) {
+				throw new ResearchError(
+					"backend_incompatible",
+					"Codex returned a malformed model catalog.",
+					false,
+				);
+			}
 			throw new ResearchError(
-				"backend_incompatible",
-				"Codex returned a malformed model catalog.",
-				false,
+				"network",
+				"Codex model discovery could not read the backend response.",
+				true,
 			);
 		}
 		const models =
@@ -569,7 +677,12 @@ export class CodexClient {
 			return [
 				{
 					id,
-					efforts: parseEfforts(entry),
+					efforts: (() => {
+						const efforts = parseEfforts(entry);
+						return defaultEffort && !efforts.includes(defaultEffort)
+							? [...efforts, defaultEffort]
+							: efforts;
+					})(),
 					...(defaultEffort ? { defaultEffort } : {}),
 					isDefault: entry.is_default === true,
 				},
@@ -664,13 +777,17 @@ export class CodexClient {
 			throw normalizeThrown(error, options.signal);
 		}
 		if (response.status >= 300 && response.status < 400) {
+			cancelResponseBody(response);
 			throw new ResearchError(
 				"backend_incompatible",
 				"Codex research attempted an unexpected redirect.",
 				false,
 			);
 		}
-		if (!response.ok) throw httpError(response, this.now(), "responses");
+		if (!response.ok) {
+			cancelResponseBody(response);
+			throw httpError(response, this.now(), "responses");
+		}
 		if (!response.body) {
 			throw new ResearchError(
 				"backend_incompatible",
@@ -749,6 +866,7 @@ export class CodexClient {
 						);
 					}
 					responseId ??= stringValue(terminalEnvelope?.id);
+					break;
 				}
 			}
 		} catch (error) {

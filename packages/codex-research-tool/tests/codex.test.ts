@@ -6,6 +6,7 @@ import {
 	CODEX_MODELS_URL,
 	CODEX_RESPONSES_URL,
 	CodexClient,
+	MAX_CATALOG_BYTES,
 	MAX_SSE_FRAME_BYTES,
 	MAX_STREAM_BYTES,
 	ResearchError,
@@ -183,9 +184,17 @@ test("recognizes explicit web-search lifecycle events", async () => {
 });
 
 test("rejects malformed, incomplete, empty, and search-less streams", async (t) => {
-	const fixtures: Array<[string, string]> = [
-		["malformed", "event: response.created\ndata: {nope}\n\n"],
-		["premature EOF", event("response.created", { response: { id: "x" } })],
+	const fixtures: Array<[string, string, string]> = [
+		[
+			"malformed",
+			"event: response.created\ndata: {nope}\n\n",
+			"backend_incompatible",
+		],
+		[
+			"premature EOF",
+			event("response.created", { response: { id: "x" } }),
+			"backend_incompatible",
+		],
 		[
 			"empty",
 			event("response.completed", {
@@ -194,6 +203,7 @@ test("rejects malformed, incomplete, empty, and search-less streams", async (t) 
 					output: [{ id: "s", type: "web_search_call" }],
 				},
 			}),
+			"backend_incompatible",
 		],
 		[
 			"no search",
@@ -210,6 +220,7 @@ test("rejects malformed, incomplete, empty, and search-less streams", async (t) 
 					],
 				},
 			}),
+			"backend_incompatible",
 		],
 		[
 			"failed event",
@@ -218,9 +229,10 @@ test("rejects malformed, incomplete, empty, and search-less streams", async (t) 
 					error: { code: "server_error", message: "raw secret details" },
 				},
 			}),
+			"network",
 		],
 	];
-	for (const [name, fixture] of fixtures) {
+	for (const [name, fixture, expectedCode] of fixtures) {
 		await t.test(name, async () => {
 			const client = new CodexClient({
 				fetch: async () => streamResponse(fixture),
@@ -229,7 +241,7 @@ test("rejects malformed, incomplete, empty, and search-less streams", async (t) 
 				client.runResearch({ query: "q", auth, model: "m" }),
 				(error: unknown) =>
 					error instanceof ResearchError &&
-					error.code === "backend_incompatible" &&
+					error.code === expectedCode &&
 					!error.message.includes("raw secret"),
 			);
 		});
@@ -288,6 +300,85 @@ test("classifies redirects and HTTP failures without reading or leaking bodies",
 			assert.equal(calls, 1);
 		});
 	}
+});
+
+test("abort during a pending SSE read is classified promptly", async () => {
+	const controller = new AbortController();
+	const client = new CodexClient({
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start() {},
+					cancel() {},
+				}),
+			),
+	});
+	const pending = client.runResearch({
+		query: "q",
+		auth,
+		model: "m",
+		signal: controller.signal,
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	controller.abort();
+	await assert.rejects(
+		pending,
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "cancelled",
+	);
+});
+
+test("a network rejection while reading the SSE stream remains retryable", async () => {
+	const client = new CodexClient({
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.error(new Error("connection reset"));
+					},
+				}),
+			),
+	});
+	await assert.rejects(
+		client.runResearch({ query: "q", auth, model: "m" }),
+		(error: unknown) => {
+			assert.ok(error instanceof ResearchError);
+			assert.equal(error.code, "network");
+			assert.equal(error.retryable, true);
+			return true;
+		},
+	);
+});
+
+test("terminal SSE event resolves without waiting for stream close and cancels reader", async () => {
+	let cancelled = false;
+	const prefix = new TextEncoder().encode(normalSse());
+	let sent = false;
+	const client = new CodexClient({
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						if (!sent) {
+							sent = true;
+							controller.enqueue(prefix);
+						}
+					},
+					cancel() {
+						cancelled = true;
+					},
+				}),
+			),
+	});
+	const result = await Promise.race([
+		client.runResearch({ query: "q", auth, model: "m" }),
+		new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error("hung")), 500),
+		),
+	]);
+	assert.equal(result.answer, "A fact.");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(cancelled, true);
 });
 
 test("maps aborts to cancellation", async () => {
@@ -368,6 +459,73 @@ test("filters models explicitly marked incompatible with API research", async ()
 		(error: unknown) =>
 			error instanceof ResearchError && error.code === "invalid_input",
 	);
+});
+
+test("model catalog has a 2 MiB bound and aborting a pending read releases its reader", async (t) => {
+	await t.test("oversized", async () => {
+		const client = new CodexClient({
+			fetch: async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new Uint8Array(MAX_CATALOG_BYTES + 1));
+							controller.close();
+						},
+					}),
+				),
+		});
+		await assert.rejects(
+			client.selectModel(auth),
+			(error: unknown) =>
+				error instanceof ResearchError && error.code === "backend_incompatible",
+		);
+	});
+	await t.test("pending abort", async () => {
+		const controller = new AbortController();
+		let cancelled = false;
+		let response!: Response;
+		const client = new CodexClient({
+			fetch: async () => {
+				response = new Response(
+					new ReadableStream<Uint8Array>({
+						cancel() {
+							cancelled = true;
+						},
+					}),
+				);
+				return response;
+			},
+		});
+		const pending = client.selectModel(auth, controller.signal);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		controller.abort();
+		await assert.rejects(
+			pending,
+			(error: unknown) =>
+				error instanceof ResearchError && error.code === "cancelled",
+		);
+		assert.equal(cancelled, true);
+		assert.equal(response.body?.locked, false);
+	});
+});
+
+test("a network rejection while reading the model catalog remains retryable", async () => {
+	const client = new CodexClient({
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.error(new Error("connection reset"));
+					},
+				}),
+			),
+	});
+	await assert.rejects(client.selectModel(auth), (error: unknown) => {
+		assert.ok(error instanceof ResearchError);
+		assert.equal(error.code, "network");
+		assert.equal(error.retryable, true);
+		return true;
+	});
 });
 
 test("classifies an empty compatible catalog as a client-version problem", async () => {

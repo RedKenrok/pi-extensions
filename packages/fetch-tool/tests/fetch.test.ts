@@ -7,6 +7,7 @@ interface FetchDetails {
 	headers?: Record<string, string>;
 	minified?: boolean;
 	outputSize?: number;
+	previewSize?: number;
 	returnedOutputSize?: number;
 	title?: string;
 	truncated?: boolean;
@@ -80,6 +81,56 @@ describe("fetch tool", () => {
 		assert.match(getText(result), /Response truncated/);
 	});
 
+	it("does not emit a replacement character when truncating UTF-8 text", async () => {
+		globalThis.fetch = async () =>
+			new Response(`a${"🙂".repeat(600)}`, {
+				headers: { "content-type": "text/plain" },
+			});
+		const result = await fetchTool().execute(
+			"call",
+			{ url: "https://example.com/unicode", maxOutputSize: 1_024 },
+			undefined,
+		);
+		const details = getDetails(result);
+		assert.equal(details.truncated, true);
+		assert.doesNotMatch(details.body ?? "", /\uFFFD/);
+	});
+
+	it("preserves a literal replacement character at the truncation boundary", async () => {
+		const prefix = `${"a".repeat(1_021)}\uFFFD`;
+		globalThis.fetch = async () =>
+			new Response(`${prefix}🙂`, {
+				headers: { "content-type": "text/plain" },
+			});
+		const result = await fetchTool().execute(
+			"call",
+			{
+				url: "https://example.com/unicode",
+				maxOutputSize: 1_024,
+			},
+			undefined,
+		);
+		assert.equal(getDetails(result).body, prefix);
+		assert.equal(getDetails(result).returnedOutputSize, 1_024);
+	});
+
+	it("distinguishes binary download size from preview size", async () => {
+		globalThis.fetch = async () =>
+			new Response(new Uint8Array(400).fill(65), {
+				headers: { "content-type": "application/octet-stream" },
+			});
+		const result = await fetchTool().execute(
+			"call",
+			{ url: "https://example.com/file" },
+			undefined,
+		);
+		assert.match(
+			getText(result),
+			/downloaded 400 bytes; showing a 150-byte preview/,
+		);
+		assert.equal(getDetails(result).previewSize, 150);
+	});
+
 	it("only base64-encodes a short binary preview", async () => {
 		globalThis.fetch = async () =>
 			new Response(new Uint8Array(4_000).fill(65), {
@@ -148,6 +199,140 @@ describe("fetch tool", () => {
 		assert.equal(details.truncated, true);
 	});
 
+	it("rejects fractional limits as validation errors", async () => {
+		for (const params of [
+			{ url: "https://example.com", timeout: 100.5 },
+			{ url: "https://example.com", maxOutputSize: 1024.5 },
+		]) {
+			await assert.rejects(
+				fetchTool().execute("call", params, undefined),
+				(error: Error & { errorType?: string }) =>
+					error.errorType === "validation",
+			);
+		}
+	});
+
+	it("throws validation errors for invalid timeout and GET/HEAD bodies", async () => {
+		for (const params of [
+			{ url: "https://example.com", timeout: Infinity },
+			{ url: "https://example.com", timeout: NaN },
+			{ url: "https://example.com", timeout: -Infinity },
+			{ url: "https://example.com", method: "GET" as const, body: "x" },
+			{ url: "https://example.com", method: "HEAD" as const, body: "x" },
+		]) {
+			await assert.rejects(fetchTool().execute("call", params, undefined));
+		}
+	});
+
+	it("cancels a body when its declared length is oversized", async () => {
+		let cancelled = false;
+		globalThis.fetch = async () =>
+			new Response(
+				new ReadableStream({
+					cancel() {
+						cancelled = true;
+					},
+				}),
+				{
+					headers: { "content-length": String(17 * 1024 * 1024) },
+				},
+			);
+		await assert.rejects(
+			fetchTool().execute("call", { url: "https://example.com" }, undefined),
+		);
+		assert.equal(cancelled, true);
+	});
+
+	it("throws on an over-limit declared length and cancels oversized streams", async () => {
+		globalThis.fetch = async () =>
+			new Response("x", {
+				headers: { "content-length": String(17 * 1024 * 1024) },
+			});
+		await assert.rejects(
+			fetchTool().execute("call", { url: "https://example.com" }, undefined),
+			/exceeds maximum/,
+		);
+
+		let cancelled = false;
+		globalThis.fetch = async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array(17 * 1024 * 1024));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				}),
+				{ headers: { "content-type": "application/octet-stream" } },
+			);
+		await assert.rejects(
+			fetchTool().execute("call", { url: "https://example.com" }, undefined),
+		);
+		assert.equal(cancelled, true);
+	});
+
+	it("cancels a response body that arrives after caller abort", async () => {
+		let cancelled = false;
+		globalThis.fetch = async () => {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return {
+				status: 200,
+				statusText: "OK",
+				headers: new Headers(),
+				url: "https://example.com/late",
+				body: {
+					cancel() {
+						cancelled = true;
+						return new Promise<void>(() => undefined);
+					},
+				},
+			} as unknown as Response;
+		};
+		const controller = new AbortController();
+		const request = fetchTool().execute(
+			"call",
+			{ url: "https://example.com/late" },
+			controller.signal,
+		);
+		controller.abort(new Error("stop"));
+
+		await assert.rejects(request);
+		assert.equal(cancelled, true);
+	});
+
+	it("does not await a stalled cancellation for an oversized response", async () => {
+		let cancelled = false;
+		globalThis.fetch = async () =>
+			({
+				status: 200,
+				statusText: "OK",
+				headers: new Headers({ "content-length": String(17 * 1024 * 1024) }),
+				url: "https://example.com/large",
+				body: {
+					cancel() {
+						cancelled = true;
+						return new Promise<void>(() => undefined);
+					},
+				},
+			}) as unknown as Response;
+
+		await assert.rejects(
+			Promise.race([
+				fetchTool().execute(
+					"call",
+					{ url: "https://example.com/large" },
+					undefined,
+				),
+				new Promise((_, reject) =>
+					setTimeout(() => reject(new Error("cleanup stalled")), 100),
+				),
+			]),
+			/exceeds maximum/,
+		);
+		assert.equal(cancelled, true);
+	});
+
 	it("reports caller cancellation separately from timeout", async () => {
 		globalThis.fetch = async (_input, init) => {
 			if (init?.signal?.aborted) {
@@ -158,15 +343,13 @@ describe("fetch tool", () => {
 		const controller = new AbortController();
 		controller.abort(new Error("stop"));
 
-		const result = await fetchTool().execute(
-			"call",
-			{ url: "https://example.com" },
-			controller.signal,
-		);
-
-		assert.equal(
-			(result.details as { errorType: string }).errorType,
-			"aborted",
+		await assert.rejects(
+			fetchTool().execute(
+				"call",
+				{ url: "https://example.com" },
+				controller.signal,
+			),
+			(error: Error & { errorType?: string }) => error.errorType === "aborted",
 		);
 	});
 });

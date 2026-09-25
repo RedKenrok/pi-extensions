@@ -1,8 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	CompactionResult,
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionHandler,
+	SessionBeforeCompactEvent,
+	SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { createCodexCompactionExtension } from "../index.ts";
 import { CODEX_RESPONSES_URL } from "../src/remote.ts";
+
+type RemoteDetails = {
+	remoteCompaction?: { item: { encrypted_content: string } };
+};
+type SessionBeforeCompactResult = {
+	cancel?: boolean;
+	compaction?: CompactionResult<RemoteDetails>;
+};
 
 const jwt = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct" } })).toString("base64url")}.y`;
 const model = {
@@ -23,14 +38,35 @@ const user = (text: string) => ({
 	timestamp: 1,
 });
 
-function fixture(options: { remoteFails?: boolean; previous?: boolean } = {}) {
-	const handlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
-	let sentBody: any;
-	let nativePreparation: any;
+function fixture(
+	options: {
+		remoteFails?: boolean;
+		previous?: boolean;
+		remoteGraceMs?: number;
+		nativeCompact?: (
+			preparation: SessionBeforeCompactEvent["preparation"],
+		) => Promise<CompactionResult>;
+		fetch?: (signal: AbortSignal) => Promise<Response>;
+		authReject?: boolean;
+		authDelay?: Promise<never>;
+	} = {},
+) {
+	const handlers = new Map<
+		string,
+		ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>
+	>();
+	let sentBody: { input: Array<Record<string, unknown>> } = { input: [] };
+	let nativePreparation: SessionBeforeCompactEvent["preparation"] | undefined;
+	let nativeCalls = 0;
 	const previousItem = { type: "compaction", encrypted_content: "previous" };
-	const prior = options.previous
+	const prior: SessionEntry | undefined = options.previous
 		? {
 				type: "compaction",
+				id: "prior",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				firstKeptEntryId: "prior",
+				tokensBefore: 10,
 				summary: "old",
 				details: {
 					readFiles: ["old-read.ts"],
@@ -49,24 +85,37 @@ function fixture(options: { remoteFails?: boolean; previous?: boolean } = {}) {
 			}
 		: undefined;
 	const pi = {
-		on(name: string, handler: (event: any, ctx: any) => Promise<any>) {
+		on(
+			name: string,
+			handler: ExtensionHandler<
+				SessionBeforeCompactEvent,
+				SessionBeforeCompactResult
+			>,
+		) {
 			handlers.set(name, handler);
 		},
 		getActiveTools: () => [],
 		getAllTools: () => [],
 	} as unknown as ExtensionAPI;
 	createCodexCompactionExtension({
-		nativeCompact: (async (preparation: any) => {
-			nativePreparation = preparation;
-			return {
-				summary: "portable",
-				firstKeptEntryId: "kept",
-				tokensBefore: 10,
-				details: { readFiles: ["new.ts"], modifiedFiles: [] },
-			};
-		}) as any,
+		...(options.remoteGraceMs !== undefined
+			? { remoteGraceMs: options.remoteGraceMs }
+			: {}),
+		nativeCompact:
+			options.nativeCompact ??
+			(async (preparation: SessionBeforeCompactEvent["preparation"]) => {
+				nativeCalls++;
+				nativePreparation = preparation;
+				return {
+					summary: "portable",
+					firstKeptEntryId: "kept",
+					tokensBefore: 10,
+					details: { readFiles: ["new.ts"], modifiedFiles: [] },
+				};
+			}),
 		fetch: async (_url, init) => {
 			sentBody = JSON.parse(String(init?.body));
+			if (options.fetch) return options.fetch(init?.signal as AbortSignal);
 			if (options.remoteFails) return new Response("failure", { status: 500 });
 			return new Response(
 				`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [{ type: "compaction", encrypted_content: "new" }] } })}\n\n`,
@@ -80,20 +129,24 @@ function fixture(options: { remoteFails?: boolean; previous?: boolean } = {}) {
 		getSystemPrompt: () => "system",
 		modelRegistry: {
 			isUsingOAuth: () => true,
-			getApiKeyAndHeaders: async () => ({
-				ok: true,
-				apiKey: jwt,
-				baseUrl: "https://chatgpt.com/backend-api",
-			}),
+			getApiKeyAndHeaders: async () => {
+				if (options.authDelay) await options.authDelay;
+				if (options.authReject) throw new Error("auth unavailable");
+				return {
+					ok: true,
+					apiKey: jwt,
+					baseUrl: "https://chatgpt.com/backend-api",
+				};
+			},
 		},
-	};
+	} as unknown as ExtensionContext;
 	const preparation = {
 		firstKeptEntryId: "kept",
 		messagesToSummarize: [user("discarded")],
 		turnPrefixMessages: [user("split-prefix")],
 		isSplitTurn: true,
 		tokensBefore: 10,
-		previousSummary: options.previous ? "old" : undefined,
+		...(options.previous ? { previousSummary: "old" } : {}),
 		fileOps: {
 			read: new Set(["new.ts"]),
 			written: new Set<string>(),
@@ -102,19 +155,162 @@ function fixture(options: { remoteFails?: boolean; previous?: boolean } = {}) {
 		settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 100 },
 	};
 	return {
-		handler: handlers.get("session_before_compact")!,
+		handler: handlers.get("session_before_compact") as ExtensionHandler<
+			SessionBeforeCompactEvent,
+			SessionBeforeCompactResult
+		>,
 		ctx,
 		preparation,
 		prior,
 		getBody: () => sentBody,
 		getNative: () => nativePreparation,
+		getNativeCalls: () => nativeCalls,
 	};
 }
+
+function pendingUntilAbort(signal: AbortSignal): Promise<Response> {
+	return new Promise((_resolve, reject) => {
+		if (signal.aborted) reject(signal.reason);
+		else
+			signal.addEventListener("abort", () => reject(signal.reason), {
+				once: true,
+			});
+	});
+}
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+const compactResult = {
+	summary: "portable",
+	firstKeptEntryId: "kept",
+	tokensBefore: 10,
+	details: { readFiles: ["new.ts"], modifiedFiles: [] },
+};
+
+async function invoke(
+	state: ReturnType<typeof fixture>,
+	signal = new AbortController().signal,
+) {
+	return state.handler(
+		{
+			type: "session_before_compact",
+			preparation: state.preparation,
+			branchEntries: [],
+			reason: "manual",
+			willRetry: false,
+			signal,
+		},
+		state.ctx,
+	);
+}
+
+test("auth resolver rejection falls back without native or remote work", async () => {
+	const state = fixture({ authReject: true });
+	assert.equal(await invoke(state), undefined);
+	assert.equal(state.getNativeCalls(), 0);
+	assert.deepEqual(state.getBody().input, []);
+});
+
+test("auth cancellation leaves no native or remote work", async () => {
+	const delayed = deferred<never>();
+	const state = fixture({ authDelay: delayed.promise });
+	const controller = new AbortController();
+	const resultPromise = invoke(state, controller.signal);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	controller.abort(new DOMException("cancelled", "AbortError"));
+	assert.equal(await resultPromise, undefined);
+	assert.equal(state.getNativeCalls(), 0);
+	assert.deepEqual(state.getBody().input, []);
+	delayed.reject(new Error("late auth failure"));
+});
+
+test("remote grace timeout returns native summary promptly and aborts remote request", async () => {
+	const remote = deferred<Response>();
+	let remoteSignal!: AbortSignal;
+	const state = fixture({
+		remoteGraceMs: 5,
+		fetch: (signal) => {
+			remoteSignal = signal;
+			return remote.promise;
+		},
+	});
+	const result = await invoke(state);
+	assert.equal(result?.compaction?.summary, "portable");
+	assert.equal(remoteSignal.aborted, true);
+	remote.resolve(new Response("late", { status: 500 }));
+});
+
+test("early remote rejection is handled while native compaction is pending", async () => {
+	const native = deferred<typeof compactResult>();
+	const state = fixture({
+		nativeCompact: () => native.promise,
+		fetch: async () => {
+			throw new Error("remote failed");
+		},
+	});
+	const resultPromise = invoke(state);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	native.resolve(compactResult);
+	assert.equal((await resultPromise)?.compaction?.summary, "portable");
+});
+
+test("caller abort during native and remote work never returns successful compaction", async () => {
+	const native = deferred<typeof compactResult>();
+	const remote = deferred<Response>();
+	const controller = new AbortController();
+	const state = fixture({
+		remoteGraceMs: 5,
+		nativeCompact: () => native.promise,
+		fetch: (signal) => pendingUntilAbort(signal),
+	});
+	const resultPromise = invoke(state, controller.signal);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	controller.abort();
+	native.resolve(compactResult);
+	assert.equal(await resultPromise, undefined);
+	remote.resolve(new Response("late", { status: 500 }));
+});
+
+test("native rejection aborts remote work and does not suppress subsequent compaction", async () => {
+	let remoteSignal: AbortSignal | undefined;
+	const started = deferred<void>();
+	let calls = 0;
+	const state = fixture({
+		remoteGraceMs: 5,
+		nativeCompact: async () => {
+			calls++;
+			if (calls === 1) {
+				await started.promise;
+				throw new Error("native failed");
+			}
+			return compactResult;
+		},
+		fetch: (signal) => {
+			remoteSignal = signal;
+			started.resolve();
+			return pendingUntilAbort(signal);
+		},
+	});
+	assert.equal(await invoke(state), undefined);
+	assert.ok(remoteSignal);
+	assert.equal(remoteSignal.aborted, true);
+	assert.equal((await invoke(state))?.compaction?.summary, "portable");
+	assert.equal(calls, 2);
+});
 
 test("hybrid compacts only discarded prefix plus split prefix and keeps portable summary", async () => {
 	const state = fixture();
 	const result = await state.handler(
 		{
+			type: "session_before_compact",
 			preparation: state.preparation,
 			branchEntries: [],
 			reason: "manual",
@@ -123,9 +319,10 @@ test("hybrid compacts only discarded prefix plus split prefix and keeps portable
 		},
 		state.ctx,
 	);
+	assert.ok(result?.compaction);
 	assert.equal(result.compaction.summary, "portable");
 	assert.equal(
-		result.compaction.details.remoteCompaction.item.encrypted_content,
+		result.compaction.details?.remoteCompaction?.item.encrypted_content,
 		"new",
 	);
 	const input = state.getBody().input;
@@ -139,23 +336,27 @@ test("successive compaction seeds prior checkpoint and merges cumulative file op
 	const state = fixture({ previous: true });
 	await state.handler(
 		{
+			type: "session_before_compact",
 			preparation: state.preparation,
-			branchEntries: [state.prior],
+			branchEntries: state.prior ? [state.prior] : [],
 			reason: "threshold",
 			willRetry: false,
 			signal: new AbortController().signal,
 		},
 		state.ctx,
 	);
-	assert.equal(state.getBody().input[0].encrypted_content, "previous");
-	assert.equal(state.getNative().fileOps.read.has("old-read.ts"), true);
-	assert.equal(state.getNative().fileOps.edited.has("old-write.ts"), true);
+	assert.equal(state.getBody().input[0]?.encrypted_content, "previous");
+	const nativePreparation = state.getNative();
+	assert.ok(nativePreparation);
+	assert.equal(nativePreparation.fileOps.read.has("old-read.ts"), true);
+	assert.equal(nativePreparation.fileOps.edited.has("old-write.ts"), true);
 });
 
 test("remote failure retains native result and custom instructions delegate entirely to Pi", async () => {
 	const state = fixture({ remoteFails: true });
 	const result = await state.handler(
 		{
+			type: "session_before_compact",
 			preparation: state.preparation,
 			branchEntries: [],
 			reason: "manual",
@@ -164,11 +365,13 @@ test("remote failure retains native result and custom instructions delegate enti
 		},
 		state.ctx,
 	);
+	assert.ok(result?.compaction);
 	assert.equal(result.compaction.summary, "portable");
-	assert.equal(result.compaction.details.remoteCompaction, undefined);
+	assert.equal(result.compaction.details?.remoteCompaction, undefined);
 	assert.equal(
 		await state.handler(
 			{
+				type: "session_before_compact",
 				preparation: state.preparation,
 				branchEntries: [],
 				customInstructions: "focus",
@@ -185,8 +388,9 @@ test("remote failure retains native result and custom instructions delegate enti
 	assert.equal(
 		await afterHybrid.handler(
 			{
+				type: "session_before_compact",
 				preparation: afterHybrid.preparation,
-				branchEntries: [afterHybrid.prior],
+				branchEntries: afterHybrid.prior ? [afterHybrid.prior] : [],
 				customInstructions: "native boundary",
 				reason: "manual",
 				willRetry: false,
