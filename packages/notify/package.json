@@ -1,0 +1,25 @@
+{
+	"name": "pi-notify",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"files": [
+		"index.ts",
+		"README.md"
+	],
+	"scripts": {
+		"test": "node --test --experimental-strip-types tests/*.test.ts",
+		"test:coverage": "node --test --experimental-strip-types --experimental-test-coverage --test-coverage-include=index.ts --test-coverage-lines=85 --test-coverage-functions=65 --test-coverage-branches=60 tests/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.85.1 <1.0.0"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}

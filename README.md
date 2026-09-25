@@ -5,6 +5,7 @@ This repository is an npm workspace of Pi extension packages I have written for 
 - [`fetch-tool`](packages/fetch-tool), which provides the `fetch` HTTP client tool.
 - [`codex-compaction`](packages/codex-compaction), which adds portable Codex remote-compaction checkpoints to Pi's native compaction lifecycle.
 - [`codex-research-tool`](packages/codex-research-tool), which provides the Codex-backed `research` tool.
+- [`pi-notify`](packages/notify), which notifies the terminal when an interactive run is ready for input.
 
 > In addition I also use `pi install npm:@everyx/pi-subagent` and `pi install npm:@everyx/pi-sleep-guard`.
 
@@ -15,6 +16,7 @@ The packages deliberately have different network and authentication boundaries:
 - `codex-research-tool` authenticates with Pi-managed `openai-codex` OAuth and sends only the supplied query plus fixed instructions to fixed `chatgpt.com` Codex endpoints. It does not forward the Pi conversation, workspace files, or local instructions.
 - `codex-compaction` sends Pi's discarded conversation prefix, along with the system prompt and active tool schemas included in the compaction request, to a fixed `chatgpt.com` Codex endpoint with Pi-managed OAuth. Its opaque checkpoint is account/model/endpoint-bound and is paired with a portable native text summary.
 - `fetch-tool` sends requests to caller-selected HTTP(S) destinations and can forward caller-supplied secrets in headers or bodies. Destinations can include local and private-network services, including after redirects; no private-network destination policy is currently enforced.
+- `pi-notify` makes no network requests, but sends the workspace basename, session name, and short session ID to the terminal or Windows notification system; they may appear in OS notification history.
 
 ## Requirements
 
@@ -29,6 +31,7 @@ These packages are intentionally private, local-use extensions, not registry rel
 pi install ./packages/fetch-tool
 pi install ./packages/codex-compaction
 pi install ./packages/codex-research-tool
+pi install ./packages/notify
 ```
 
 For development, packages can instead be symlinked into Pi's user extension directory (use `.pi/extensions/` for project-local discovery), then loaded with `/reload`:
@@ -38,6 +41,7 @@ mkdir -p ~/.pi/agent/extensions
 ln -s "$(pwd)/packages/fetch-tool" ~/.pi/agent/extensions/fetch-tool
 ln -s "$(pwd)/packages/codex-compaction" ~/.pi/agent/extensions/codex-compaction
 ln -s "$(pwd)/packages/codex-research-tool" ~/.pi/agent/extensions/codex-research-tool
+ln -s "$(pwd)/packages/notify" ~/.pi/agent/extensions/notify
 ```
 
 ## Development
