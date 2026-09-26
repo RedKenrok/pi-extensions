@@ -1,17 +1,10 @@
-import {
-	BodyTooLargeError,
-	readBodyWithLimit,
-} from "pi-extensions-shared/body";
+import { BodyTooLargeError, readBodyWithLimit } from "shared/body";
 import {
 	CODEX_MODELS_URL,
 	CODEX_RESPONSES_URL,
 	codexRequestHeaders,
-} from "pi-extensions-shared/codex";
-import {
-	parseSseFrame,
-	SseLimitError,
-	sseFrames,
-} from "pi-extensions-shared/sse";
+} from "shared/codex";
+import { parseSseFrame, SseLimitError, sseFrames } from "shared/sse";
 import type { ReadyAuth } from "./auth.ts";
 import { type ModelOption, ResearchError, researchError } from "./errors.ts";
 import { CATALOG_CACHE_TTL_MS } from "./limits.ts";
@@ -27,7 +20,7 @@ export {
 	CODEX_MODELS_URL,
 	CODEX_ORIGIN,
 	CODEX_RESPONSES_URL,
-} from "pi-extensions-shared/codex";
+} from "shared/codex";
 export {
 	type ModelOption,
 	ResearchError,

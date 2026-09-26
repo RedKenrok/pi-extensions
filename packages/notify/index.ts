@@ -5,9 +5,9 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { createDiagnostics } from "pi-extensions-shared/diagnostics";
+import { createDiagnostics } from "shared/diagnostics";
 
-const PACKAGE_NAME = "pi-notify";
+const PACKAGE_NAME = "notify";
 const TOAST_TIMEOUT_MS = 3000;
 
 // Keep dynamic labels short, single-line, and safe for OSC and toast text.

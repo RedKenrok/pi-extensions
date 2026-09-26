@@ -1,11 +1,11 @@
-import { createDiagnostics } from "pi-extensions-shared/diagnostics";
+import { createDiagnostics } from "shared/diagnostics";
 import pkg from "../package.json" with { type: "json" };
 
 export {
 	isRecord,
 	nonemptyString,
 	stringValue,
-} from "pi-extensions-shared/record";
+} from "shared/record";
 
 export const PACKAGE_NAME: string = pkg.name;
 export const PACKAGE_VERSION: string = pkg.version;

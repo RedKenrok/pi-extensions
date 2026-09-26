@@ -1,5 +1,5 @@
 {
-	"name": "pi-notify",
+	"name": "notify",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
@@ -25,10 +25,10 @@
 		"functions": 82
 	},
 	"dependencies": {
-		"pi-extensions-shared": "0.1.0"
+		"shared": "0.1.0"
 	},
 	"bundleDependencies": [
-		"pi-extensions-shared"
+		"shared"
 	],
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=0.85.1 <1.0.0"

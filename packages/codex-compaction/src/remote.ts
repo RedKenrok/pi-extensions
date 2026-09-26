@@ -9,10 +9,10 @@ import {
 	CODEX_BASE_URL,
 	CODEX_RESPONSES_URL,
 	codexRequestHeaders,
-} from "pi-extensions-shared/codex";
-import { chatgptAccountIdFromToken } from "pi-extensions-shared/jwt";
-import { isRecord } from "pi-extensions-shared/record";
-import { parseSseFrame } from "pi-extensions-shared/sse";
+} from "shared/codex";
+import { chatgptAccountIdFromToken } from "shared/jwt";
+import { isRecord } from "shared/record";
+import { parseSseFrame } from "shared/sse";
 import { compactionFrames, MAX_FRAME_BYTES } from "./sse.ts";
 
 type AgentMessage =
@@ -21,8 +21,8 @@ type AgentMessage =
 export {
 	CODEX_BASE_URL,
 	CODEX_RESPONSES_URL,
-} from "pi-extensions-shared/codex";
-export { isRecord } from "pi-extensions-shared/record";
+} from "shared/codex";
+export { isRecord } from "shared/record";
 export { MAX_FRAME_BYTES, MAX_STREAM_BYTES } from "./sse.ts";
 export const BETA_FEATURE = "remote_compaction_v2";
 export const MAX_REQUEST_BYTES = 16 * 1024 * 1024;

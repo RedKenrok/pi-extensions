@@ -271,11 +271,11 @@ test("reports delivery failures on stderr only when debugging is enabled", () =>
 	quiet.settle();
 	assert.deepEqual(quiet.errors, []);
 
-	const named = harness({ PI_EXT_DEBUG: "fetch-tool, pi-notify" }, "tui", "", {
+	const named = harness({ PI_EXT_DEBUG: "fetch-tool, notify" }, "tui", "", {
 		write: failingWrite,
 	});
 	named.settle();
-	assert.deepEqual(named.errors, ["[pi-notify] write_failed\n"]);
+	assert.deepEqual(named.errors, ["[notify] write_failed\n"]);
 
 	const other = harness({ PI_EXT_DEBUG: "fetch-tool" }, "tui", "", {
 		write: failingWrite,
@@ -293,8 +293,8 @@ test("reports delivery failures on stderr only when debugging is enabled", () =>
 	toasts.settle();
 	toasts.toasts[0]?.callback(new Error("exit 1"));
 	assert.deepEqual(toasts.errors, [
-		"[pi-notify] toast_busy\n",
-		"[pi-notify] toast_failed\n",
+		"[notify] toast_busy\n",
+		"[notify] toast_failed\n",
 	]);
 
 	const spawn = harness(
@@ -311,8 +311,8 @@ test("reports delivery failures on stderr only when debugging is enabled", () =>
 	spawn.settle();
 	spawn.settle();
 	assert.deepEqual(spawn.errors, [
-		"[pi-notify] toast_spawn_failed\n",
-		"[pi-notify] toast_spawn_failed\n",
+		"[notify] toast_spawn_failed\n",
+		"[notify] toast_spawn_failed\n",
 	]);
 
 	const brokenStderr = harness({ PI_EXT_DEBUG: "*" }, "tui", undefined, {

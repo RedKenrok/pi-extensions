@@ -99,7 +99,7 @@ async function runtimeSources(packagePath) {
 	return sources;
 }
 
-const SHARED_NAME = "pi-extensions-shared";
+const SHARED_NAME = "shared";
 const sharedRoot = join(root, "packages/shared");
 const BUNDLED_PREFIX = `node_modules/${SHARED_NAME}/`;
 

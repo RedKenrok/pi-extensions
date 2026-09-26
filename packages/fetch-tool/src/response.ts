@@ -1,7 +1,4 @@
-import {
-	BodyTooLargeError,
-	readBodyWithLimit,
-} from "pi-extensions-shared/body";
+import { BodyTooLargeError, readBodyWithLimit } from "shared/body";
 
 /**
  * Reads the body with a hard byte limit, reporting an overrun as the tool's

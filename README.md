@@ -5,9 +5,9 @@ This repository is an npm workspace of Pi extension packages I have written for 
 - [`fetch-tool`](packages/fetch-tool), which provides the `fetch` HTTP client tool.
 - [`codex-compaction`](packages/codex-compaction), which adds portable Codex remote-compaction checkpoints to Pi's native compaction lifecycle.
 - [`codex-research-tool`](packages/codex-research-tool), which provides the Codex-backed `research` tool.
-- [`pi-notify`](packages/notify), which notifies the terminal when an interactive run is ready for input.
+- [`notify`](packages/notify), which notifies the terminal when an interactive run is ready for input.
 
-[`pi-extensions-shared`](packages/shared) is not an extension. It holds runtime helpers used by several packages (Codex endpoints and headers, JWT account parsing, SSE framing, bounded body reads, `PI_EXT_DEBUG` diagnostics).
+[`shared`](packages/shared) is not an extension. It holds runtime helpers used by several packages (Codex endpoints and headers, JWT account parsing, SSE framing, bounded body reads, `PI_EXT_DEBUG` diagnostics).
 
 > In addition I also use `pi install npm:@everyx/pi-subagent` and `pi install npm:@everyx/pi-sleep-guard`.
 
@@ -18,7 +18,7 @@ The packages deliberately have different network and authentication boundaries:
 - `codex-research-tool` authenticates with Pi-managed `openai-codex` OAuth and sends only the supplied query plus fixed instructions to fixed `chatgpt.com` Codex endpoints. It does not forward the Pi conversation, workspace files, or local instructions.
 - `codex-compaction` sends Pi's discarded conversation prefix, along with the system prompt and active tool schemas included in the compaction request, to a fixed `chatgpt.com` Codex endpoint with Pi-managed OAuth. Its opaque checkpoint is account/model/endpoint-bound and is paired with a portable native text summary.
 - `fetch-tool` sends requests to caller-selected HTTP(S) destinations and can forward caller-supplied secrets in headers or bodies. Destinations can include local and private-network services, including after redirects; no private-network destination policy is currently enforced.
-- `pi-notify` makes no network requests, but sends the workspace basename, session name, and short session ID to the terminal or Windows notification system; they may appear in OS notification history.
+- `notify` makes no network requests, but sends the workspace basename, session name, and short session ID to the terminal or Windows notification system; they may appear in OS notification history.
 
 ## Requirements
 
@@ -48,7 +48,7 @@ ln -s "$(pwd)/packages/notify" ~/.pi/agent/extensions/notify
 
 ## Shared code
 
-Every extension is installed on its own, so shared runtime code cannot be imported across packages by path. Instead each extension declares `pi-extensions-shared` as a dependency and lists it in `bundleDependencies`:
+Every extension is installed on its own, so shared runtime code cannot be imported across packages by path. Instead each extension declares `shared` as a dependency and lists it in `bundleDependencies`:
 
 - `npm install` at the repository root links the live shared sources into **each consumer's** `node_modules` (also available via `npm run link:shared`). Pi resolves imports from the symlinked extension path, so a hoisted workspace link at the root alone is not sufficient. Local installs (`pi install ./packages/<name>`) and symlinked extensions use these live sources.
 - When a package is packed, its `prepack` script (`scripts/bundle-shared.mjs`) temporarily copies the shared package into that package's own `node_modules` so the archive is self-contained; `postpack` restores the local link. npm does not bundle workspace symlinks on its own.
@@ -57,7 +57,7 @@ Every extension is installed on its own, so shared runtime code cannot be import
 
 ## Diagnostics
 
-Every package falls back quietly by default: a failed notification, a remote compaction that falls back to native, or an unconvertible page never interrupts Pi. To see why, set `PI_EXT_DEBUG` to a comma-separated list of package names (`fetch-tool`, `codex-compaction`, `codex-research-tool`, `pi-notify`) or `*`. Each enabled package then writes one `[package] reason-code` line to stderr per event. Lines never contain credentials, account IDs, URLs with userinfo, request bodies, or conversation content.
+Every package falls back quietly by default: a failed notification, a remote compaction that falls back to native, or an unconvertible page never interrupts Pi. To see why, set `PI_EXT_DEBUG` to a comma-separated list of package names (`fetch-tool`, `codex-compaction`, `codex-research-tool`, `notify`) or `*`. Each enabled package then writes one `[package] reason-code` line to stderr per event. Lines never contain credentials, account IDs, URLs with userinfo, request bodies, or conversation content.
 
 ## Development
 

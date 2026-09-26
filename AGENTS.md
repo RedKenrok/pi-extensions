@@ -1,6 +1,6 @@
 - Run the linter (`npm run lint`) and tests (`npm run test`) after changing code.
 - Put test helpers used by more than one package in `test-support/`, not in a package's `tests/`.
-- Runtime code used by more than one package goes in `packages/shared` (`pi-extensions-shared`), imported as `pi-extensions-shared/<module>`. Never import another package by relative path: every package is installed on its own and only the bundled shared package travels with it.
-- A package that imports `pi-extensions-shared` must list it in both `dependencies` and `bundleDependencies` and keep the `prepack`/`postpack` scripts that call `scripts/bundle-shared.mjs`.
+- Runtime code used by more than one package goes in the `shared` package (`packages/shared`), imported as `shared/<module>`. Never import another package by relative path: every package is installed on its own and only the bundled shared package travels with it.
+- A package that imports `shared` must list it in both `dependencies` and `bundleDependencies` and keep the `prepack`/`postpack` scripts that call `scripts/bundle-shared.mjs`.
 - Test scripts go through `scripts/test.mjs`; coverage scope and thresholds live under `testCoverage` in each package's `package.json`.
 - Opt-in diagnostics follow one convention: `PI_EXT_DEBUG` (comma-separated package names or `*`), one `[package] reason-code` line on stderr, never secrets or content.

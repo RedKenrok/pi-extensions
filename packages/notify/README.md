@@ -1,6 +1,6 @@
-# pi-notify
+# notify
 
-`pi-notify` is a Pi extension that notifies you when an interactive run has fully settled and Pi is ready for input.
+`notify` is a Pi extension that notifies you when an interactive run has fully settled and Pi is ready for input.
 
 ## Requirements and loading
 
@@ -46,7 +46,7 @@ Inside GNU screen (`STY` is set, and `TMUX` is not), sequences are wrapped in sc
 
 ### Diagnostics
 
-Failures are silent by default. Set `PI_EXT_DEBUG` to a comma-separated list of package names (or `*`) that includes `pi-notify` to print one line per failure to standard error, such as `[pi-notify] write_failed`. The reason codes are `write_failed`, `toast_spawn_failed`, `toast_failed`, and `toast_busy`.
+Failures are silent by default. Set `PI_EXT_DEBUG` to a comma-separated list of package names (or `*`) that includes `notify` to print one line per failure to standard error, such as `[notify] write_failed`. The reason codes are `write_failed`, `toast_spawn_failed`, `toast_failed`, and `toast_busy`.
 
 ## Security and privacy
 

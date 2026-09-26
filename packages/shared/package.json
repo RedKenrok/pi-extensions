@@ -1,5 +1,5 @@
 {
-	"name": "pi-extensions-shared",
+	"name": "shared",
 	"version": "0.1.0",
 	"private": true,
 	"description": "Runtime helpers bundled into each extension package; not a Pi extension itself.",

@@ -1,4 +1,4 @@
-import { SseLimitError, sseFrames } from "pi-extensions-shared/sse";
+import { SseLimitError, sseFrames } from "shared/sse";
 
 export const MAX_STREAM_BYTES = 8 * 1024 * 1024;
 export const MAX_FRAME_BYTES = 2 * 1024 * 1024;

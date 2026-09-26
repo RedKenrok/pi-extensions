@@ -27,10 +27,10 @@
 		"functions": 89
 	},
 	"dependencies": {
-		"pi-extensions-shared": "0.1.0"
+		"shared": "0.1.0"
 	},
 	"bundleDependencies": [
-		"pi-extensions-shared"
+		"shared"
 	],
 	"peerDependencies": {
 		"@earendil-works/pi-ai": ">=0.85.1 <1.0.0",

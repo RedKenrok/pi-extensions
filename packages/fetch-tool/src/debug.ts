@@ -1,7 +1,4 @@
-import {
-	createDiagnostics,
-	type DiagnosticsOptions,
-} from "pi-extensions-shared/diagnostics";
+import { createDiagnostics, type DiagnosticsOptions } from "shared/diagnostics";
 
 const PACKAGE_NAME = "fetch-tool";
 

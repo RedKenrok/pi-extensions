@@ -1,7 +1,4 @@
-import {
-	createDiagnostics,
-	diagnosticsEnabled,
-} from "pi-extensions-shared/diagnostics";
+import { createDiagnostics, diagnosticsEnabled } from "shared/diagnostics";
 
 export const PACKAGE_NAME = "codex-compaction";
 

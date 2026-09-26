@@ -1,4 +1,4 @@
-import { chatgptAccountIdFromToken } from "pi-extensions-shared/jwt";
+import { chatgptAccountIdFromToken } from "shared/jwt";
 import { SIGN_IN, SIGN_IN_AGAIN } from "./errors.ts";
 import {
 	AUTH_CACHE_TTL_MS,

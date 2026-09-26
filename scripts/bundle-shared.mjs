@@ -1,6 +1,6 @@
 // Runs as a consumer package's prepack/postpack script (cwd is that package).
 //
-// npm workspaces hoist `pi-extensions-shared` to a symlink in the repository
+// npm workspaces hoist `shared` to a symlink in the repository
 // root, and `npm pack` does not follow hoisted symlinks when it collects
 // bundleDependencies. Copying the shared package into the consumer's own
 // node_modules just for the duration of the pack makes the tarball
@@ -10,7 +10,7 @@
 import { cp, glob, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 
-const SHARED_NAME = "pi-extensions-shared";
+const SHARED_NAME = "shared";
 const sharedRoot = resolve(import.meta.dirname, "../packages/shared");
 async function linkShared(consumerRoot) {
 	const consumerModules = join(consumerRoot, "node_modules");
