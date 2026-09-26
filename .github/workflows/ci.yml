@@ -18,24 +18,14 @@ jobs:
     # Streaming and cancellation tests can hang rather than fail when they
     # regress; bound the job so a hang costs minutes, not the 6-hour default.
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [22.19.0, 24.x, 26.x]
-        pi: [0.85.1, 0.87.1]
-    env:
-      PI_VERSION: ${{ matrix.pi }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 26.x
           cache: npm
+      # Pi comes from the lockfile's pinned devDependencies. Installing other
+      # versions afterwards would prune the package-local shared links that
+      # the root postinstall creates.
       - run: npm ci
-      - name: Install exact Pi matrix peers
-        run: |
-          npm install --no-save --package-lock=false \
-            @earendil-works/pi-coding-agent@${PI_VERSION} \
-            @earendil-works/pi-ai@${PI_VERSION} \
-            @earendil-works/pi-tui@${PI_VERSION}
       - run: npm run ci

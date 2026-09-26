@@ -20,7 +20,7 @@ The slash commands do not perform research or start an LLM turn. The `research` 
 ## Requirements
 
 - Node.js 22.19 or newer.
-- Pi `@earendil-works/pi-coding-agent` `>=0.85.1 <1.0.0`. CI tests Pi 0.85.1 and 0.87.1.
+- Pi `@earendil-works/pi-coding-agent` `>=0.85.1 <1.0.0`. CI tests Pi 0.87.1.
 - A Pi-managed `openai-codex` OAuth login containing a refreshable access token and ChatGPT account ID.
 - ChatGPT/Codex subscription capacity for each research request.
 

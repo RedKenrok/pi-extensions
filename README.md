@@ -23,7 +23,7 @@ The packages deliberately have different network and authentication boundaries:
 ## Requirements
 
 - Node.js 22.19.0 or newer.
-- Pi `@earendil-works/pi-coding-agent` `>=0.85.1 <1.0.0` (extension packages declare this peer range). CI tests the pinned 0.85.1 minimum and 0.87.1 current compatibility set, with matching `pi-ai` and `pi-tui` peers where applicable. This does not claim compatibility with every release in the broad peer range.
+- Pi `@earendil-works/pi-coding-agent` `>=0.85.1 <1.0.0` (extension packages declare this peer range). CI tests the pinned current release (0.87.1), with matching `pi-ai` and `pi-tui` peers where applicable. This does not claim compatibility with every release in the broad peer range.
 
 ## Installation and loading
 
@@ -68,7 +68,7 @@ npm install
 npm run ci
 ```
 
-`npm run ci` type-checks all packages, runs read-only Biome checks, executes every workspace's tests and coverage thresholds, and verifies local package archives plus isolated consumer installs with exact Pi peers, loads every advertised TypeScript extension entrypoint through Pi's loader, and checks Pi peer dependency resolution. The consumer verifier may fetch dependencies from the configured npm registry but never publishes packages. CI runs the suite on Node 22.19.0 (the declared minimum), 24.x, and 26.x against coherent Pi peer versions 0.85.1 and 0.87.1. The current-version job installs overrides in its ephemeral CI checkout without saving them to the lockfile; local consumers of the verifier are scratch directories. The repository uses one root lockfile and keeps development-only dependencies in the root package.
+`npm run ci` type-checks all packages, runs read-only Biome checks, executes every workspace's tests and coverage thresholds, and verifies local package archives plus isolated consumer installs with exact Pi peers, loads every advertised TypeScript extension entrypoint through Pi's loader, and checks Pi peer dependency resolution. The consumer verifier may fetch dependencies from the configured npm registry but never publishes packages. CI runs the suite once, on Node 26.x against the Pi versions pinned in the root lockfile; local consumers of the verifier are scratch directories. The repository uses one root lockfile and keeps development-only dependencies in the root package.
 
 Tests import shared helpers (deferred promises, JWT and SSE fixtures, an event-loop hold for `AbortSignal.timeout()` waits) from the root `test-support/` directory. It is linted and type-checked with the packages, and the package verifier rejects any archive that contains it.
 

@@ -1,6 +1,6 @@
 # codex-compaction
 
-A Pi extension (tested with Pi 0.85.1 and 0.87.1, peer range `>=0.85.1 <1.0.0`) that uses Codex `RemoteCompactionV2` checkpoints when the active model is the trusted, Pi-managed `openai-codex` provider. Pi remains responsible for deciding when to compact, selecting the discarded prefix and retained tail, and persisting the resulting `CompactionEntry`.
+A Pi extension (tested with Pi 0.87.1, peer range `>=0.85.1 <1.0.0`) that uses Codex `RemoteCompactionV2` checkpoints when the active model is the trusted, Pi-managed `openai-codex` provider. Pi remains responsible for deciding when to compact, selecting the discarded prefix and retained tail, and persisting the resulting `CompactionEntry`.
 
 ## Usage
 
