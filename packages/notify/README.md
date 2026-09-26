@@ -22,15 +22,18 @@ For project-local installation, add `--local` to `pi install`. For development, 
 
 The notification title includes the basename of the current working directory. Its body includes the Pi session name (or “Thread”), the first eight characters of the session ID, and “Ready for input.” This helps distinguish threads in the same workspace. Notification labels are shortened and sanitized before delivery.
 
-The extension listens for `agent_settled`, not `agent_end`, so it waits until retries and queued work finish. It notifies only in interactive TUI mode with a TTY on standard output. No notification is sent in print, JSON, or RPC mode. The delivery method is chosen in this order:
+The extension listens for `agent_settled`, not `agent_end`, so it waits until retries and queued work finish. It notifies only in interactive TUI mode with a TTY on standard output. No notification is sent in print, JSON, or RPC mode. By default, runs shorter than 10 seconds do not notify; this uses `before_agent_start` as the start of the run (including retries and queued work).
 
-1. A PowerShell toast when `WT_SESSION` is set and Pi runs on Windows or inside WSL (`WSL_DISTRO_NAME`). An inherited `WT_SESSION` in a remote or nested Linux shell falls through to the escape sequences below.
-2. OSC 99 when `KITTY_WINDOW_ID` is set (Kitty).
-3. OSC 777 otherwise (for terminals such as Ghostty, iTerm2, WezTerm, and rxvt-unicode). Support for OSC 777 depends on the terminal.
+Configure with environment variables before starting Pi:
+
+- `PI_NOTIFY_MIN_RUN_MS`: minimum elapsed run time in milliseconds (default `10000`; `0` notifies on every settle). Invalid values use the default. If no start event was observed, the default filter skips the settle.
+- `PI_NOTIFY_METHOD`: `auto` (default), `kitty`, `osc777`, `toast`, or `off`. Explicit methods bypass terminal detection but still require a TUI and stdout TTY. Use `off` to disable notifications.
+
+`auto` selects a PowerShell toast when `WT_SESSION` is set and Pi runs on Windows or inside WSL (`WSL_DISTRO_NAME`); otherwise OSC 99 when `KITTY_WINDOW_ID` is set. Other terminals are not assumed to support notifications. To enable OSC 777 for a terminal that supports it, set `PI_NOTIFY_METHOD=osc777`. An inherited `WT_SESSION` in a remote Linux shell does not select PowerShell.
 
 Kitty notifications use unique IDs; Kitty's default click action focuses the originating window. Other terminals' click behavior is terminal-dependent. The extension does not switch tabs or navigate to a Pi session on click.
 
-Delivery is best-effort: delivery failures never stop Pi. PowerShell toasts have a three-second process timeout, and at most one toast process runs at a time; a settle that happens while a toast is still starting is skipped.
+Delivery is best-effort: delivery failures never stop Pi. PowerShell toasts have a three-second process timeout, and at most one toast process runs at a time; while one runs, the latest subsequent notification is kept and sent after it exits (even if it fails). Kitty's title and body sequences are combined into one stdout write; an OS-level partial write is still possible.
 
 Escape sequences are written directly to standard output, because Pi (checked through 0.87.1) gives extensions no API for raw terminal output; `ctx.ui.notify` only shows a message inside the TUI. Notifications fire on `agent_settled`, when the TUI is idle, so these writes do not land in the middle of a render.
 
@@ -46,7 +49,7 @@ Inside GNU screen (`STY` is set, and `TMUX` is not), sequences are wrapped in sc
 
 ### Diagnostics
 
-Failures are silent by default. Set `PI_EXT_DEBUG` to a comma-separated list of package names (or `*`) that includes `notify` to print one line per failure to standard error, such as `[notify] write_failed`. The reason codes are `write_failed`, `toast_spawn_failed`, `toast_failed`, and `toast_busy`.
+Failures are silent by default. Set `PI_EXT_DEBUG` to a comma-separated list of package names (or `*`) that includes `notify` to print one line per failure to standard error, such as `[notify] write_failed`. The reason codes are `write_failed`, `toast_spawn_failed`, and `toast_failed`.
 
 ## Security and privacy
 
@@ -54,4 +57,4 @@ The extension makes no network requests and does not send conversation content o
 
 ## Development
 
-From the repository root, run `npm run lint`, `npm run test`, and `npm run test:coverage`. The tests cover lifecycle and non-interactive behavior, terminal and platform selection, Kitty IDs, tmux passthrough, label sanitization and toast escaping, the single in-flight toast, delivery failures, and debug diagnostics. They do not validate OS-level notification display or click behavior; test those manually in your terminal.
+From the repository root, run `npm run lint`, `npm run test`, and `npm run test:coverage`. The tests cover lifecycle and non-interactive behavior, terminal and platform selection, Kitty IDs, tmux passthrough, label sanitization and toast escaping, the queued latest toast, run-duration filtering, delivery failures, and debug diagnostics. They do not validate OS-level notification display or click behavior; test those manually in your terminal.

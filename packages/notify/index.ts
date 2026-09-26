@@ -9,6 +9,27 @@ import { createDiagnostics } from "shared/diagnostics";
 
 const PACKAGE_NAME = "notify";
 const TOAST_TIMEOUT_MS = 3000;
+const DEFAULT_MIN_RUN_MS = 10_000;
+type Delivery = "auto" | "off" | "kitty" | "osc777" | "toast";
+
+function delivery(env: NodeJS.ProcessEnv): Delivery {
+	const value = env.PI_NOTIFY_METHOD;
+	return value === "off" ||
+		value === "kitty" ||
+		value === "osc777" ||
+		value === "toast"
+		? value
+		: "auto";
+}
+
+function minimumRunMs(env: NodeJS.ProcessEnv): number {
+	const value = env.PI_NOTIFY_MIN_RUN_MS;
+	if (value === undefined) return DEFAULT_MIN_RUN_MS;
+	const number = Number(value);
+	return Number.isSafeInteger(number) && number >= 0
+		? number
+		: DEFAULT_MIN_RUN_MS;
+}
 
 // Keep dynamic labels short, single-line, and safe for OSC and toast text.
 function label(value: string): string {
@@ -95,6 +116,7 @@ export type NotifyOptions = {
 	write: (text: string) => void;
 	writeError: (text: string) => void;
 	execFile: ExecFile;
+	now: () => number;
 };
 
 const defaultOptions = (): NotifyOptions => ({
@@ -108,6 +130,7 @@ const defaultOptions = (): NotifyOptions => ({
 		process.stderr.write(text);
 	},
 	execFile: nodeExecFile,
+	now: () => performance.now(),
 });
 
 export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
@@ -120,9 +143,10 @@ export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
 	// A cold PowerShell start takes up to a second, so rapid settles would
 	// otherwise stack processes that all show the same notification.
 	let toastInFlight = false;
+	let pendingToast: string | undefined;
 	const toast = (script: string): void => {
 		if (toastInFlight) {
-			debug("toast_busy");
+			pendingToast = script;
 			return;
 		}
 		toastInFlight = true;
@@ -134,6 +158,9 @@ export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
 				(error) => {
 					toastInFlight = false;
 					if (error) debug("toast_failed");
+					const next = pendingToast;
+					pendingToast = undefined;
+					if (next !== undefined) toast(next);
 				},
 			);
 		} catch {
@@ -148,25 +175,45 @@ export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
 		Boolean(options.env.WT_SESSION) &&
 		(options.platform === "win32" || Boolean(options.env.WSL_DISTRO_NAME));
 
+	const method = delivery(options.env);
+	const minRunMs = minimumRunMs(options.env);
+	let startedAt: number | undefined;
 	return (pi: ExtensionAPI) => {
+		pi.on("before_agent_start", () => {
+			startedAt = options.now();
+		});
 		// Unlike agent_end, agent_settled fires only after retries and queued work finish.
 		pi.on("agent_settled", (_event, ctx) => {
-			if (ctx.mode !== "tui" || !options.isTTY()) return;
+			const start = startedAt;
+			startedAt = undefined;
+			if (ctx.mode !== "tui" || !options.isTTY() || method === "off") return;
+			if (
+				minRunMs > 0 &&
+				(start === undefined || options.now() - start < minRunMs)
+			)
+				return;
+			const selected =
+				method === "auto"
+					? useToast()
+						? "toast"
+						: options.env.KITTY_WINDOW_ID
+							? "kitty"
+							: "off"
+					: method;
+			if (selected === "off") return;
 			// Delivery is best-effort; a broken terminal or toast must not fail Pi's run.
 			try {
 				const { title, body } = notificationText(ctx);
-				if (useToast()) {
+				if (selected === "toast") {
 					toast(windowsToastScript(title, body));
-				} else if (options.env.KITTY_WINDOW_ID) {
+				} else if (selected === "kitty") {
 					// Unique IDs prevent separate threads/runs from replacing one another.
 					// Kitty's default click action focuses the originating window.
 					const id = randomUUID();
 					const end = oscEnd(options.env);
 					options.write(
-						forTerminal(`\x1b]99;i=${id}:d=0;${title}${end}`, options.env),
-					);
-					options.write(
-						forTerminal(`\x1b]99;i=${id}:p=body;${body}${end}`, options.env),
+						forTerminal(`\x1b]99;i=${id}:d=0;${title}${end}`, options.env) +
+							forTerminal(`\x1b]99;i=${id}:p=body;${body}${end}`, options.env),
 					);
 				} else {
 					options.write(
