@@ -1,5 +1,14 @@
 import { spawn } from "node:child_process";
-import { glob, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+	glob,
+	lstat,
+	mkdir,
+	mkdtemp,
+	readFile,
+	readlink,
+	rm,
+	symlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -136,6 +145,42 @@ async function verifyPackage(packagePath, scratch) {
 		throw new Error(
 			`${manifest.name}: pi.extensions must be an array of strings`,
 		);
+	}
+
+	// Reproduce user extension discovery through a symlink outside the checkout.
+	// Pi's jiti resolves imports relative to the symlink path, not the real path.
+	const symlinkAgent = join(scratch, `${manifest.name}-agent`);
+	const symlinkPath = join(symlinkAgent, "extensions", manifest.name);
+	await mkdir(join(symlinkAgent, "extensions"), { recursive: true });
+	await symlink(packagePath, symlinkPath, "dir");
+	const { DefaultResourceLoader: LocalLoader } = await import(
+		pathToFileURL(
+			join(root, "node_modules/@earendil-works/pi-coding-agent/dist/index.js"),
+		).href
+	);
+	const localLoader = new LocalLoader({
+		cwd: scratch,
+		agentDir: symlinkAgent,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+	});
+	await localLoader.reload();
+	const localResult = localLoader.getExtensions();
+	if (localResult.errors.length > 0)
+		throw new Error(
+			`${manifest.name}: symlinked extension failed to load: ${localResult.errors.map(({ error }) => formatError(error)).join("\n")}`,
+		);
+	for (const entry of entrypoints) {
+		if (
+			!localResult.extensions.some(
+				({ resolvedPath }) => resolvedPath === resolve(symlinkPath, entry),
+			)
+		)
+			throw new Error(
+				`${manifest.name}: symlinked extension ${entry} not loaded`,
+			);
 	}
 
 	const dryRun = JSON.parse(
@@ -304,18 +349,27 @@ try {
 	const failures = results
 		.filter((result) => result.status === "rejected")
 		.map((result) => formatError(result.reason));
-	// postpack removes the temporary bundle; a leftover copy would shadow the
-	// live shared sources in local development.
+	// postpack must restore a live link rather than leave a stale copy.
 	for (const packagePath of packageDirs) {
+		const manifest = await readJson(join(packagePath, "package.json"));
+		if (!(SHARED_NAME in (manifest.dependencies ?? {}))) continue;
+		const path = join(packagePath, "node_modules", SHARED_NAME);
 		try {
-			await readFile(
-				join(packagePath, "node_modules", SHARED_NAME, "package.json"),
-			);
-			failures.push(
-				`${packagePath}: stale bundled ${SHARED_NAME} left in node_modules after packing`,
-			);
+			const stat = await lstat(path);
+			if (
+				!stat.isSymbolicLink() ||
+				resolve(packagePath, "node_modules", await readlink(path)) !==
+					sharedRoot
+			)
+				failures.push(
+					`${packagePath}: ${SHARED_NAME} is not linked to live shared sources`,
+				);
 		} catch (error) {
-			if (error.code !== "ENOENT") throw error;
+			if (error.code === "ENOENT")
+				failures.push(
+					`${packagePath}: missing ${SHARED_NAME} development link`,
+				);
+			else throw error;
 		}
 	}
 	if (failures.length > 0) throw new Error(failures.join("\n\n"));

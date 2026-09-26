@@ -16,7 +16,7 @@ pi install ./packages/notify
 pi -e ./packages/notify
 ```
 
-For project-local installation, add `--local` to `pi install`. For development, symlink `packages/notify` into `~/.pi/agent/extensions/` and run `/reload`.
+For project-local installation, add `--local` to `pi install`. For development, run `npm install` at the repository root, symlink `packages/notify` into `~/.pi/agent/extensions/`, and run `/reload`. The root install links the shared runtime beside the extension so Pi can resolve it through the symlink.
 
 ## Behavior
 

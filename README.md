@@ -36,7 +36,7 @@ pi install ./packages/codex-research-tool
 pi install ./packages/notify
 ```
 
-For development, packages can instead be symlinked into Pi's user extension directory (use `.pi/extensions/` for project-local discovery), then loaded with `/reload`:
+For development, run `npm install` at the checkout root first, then symlink packages into Pi's user extension directory (use `.pi/extensions/` for project-local discovery) and load with `/reload`. If you move or switch checkouts, update old extension symlinks to point at the checkout you installed:
 
 ```sh
 mkdir -p ~/.pi/agent/extensions
@@ -50,10 +50,10 @@ ln -s "$(pwd)/packages/notify" ~/.pi/agent/extensions/notify
 
 Every extension is installed on its own, so shared runtime code cannot be imported across packages by path. Instead each extension declares `pi-extensions-shared` as a dependency and lists it in `bundleDependencies`:
 
-- In the repository, npm workspaces link it from the root `node_modules`, so local installs (`pi install ./packages/<name>`, which load the package in place) and tests use the live sources. Run `npm install` at the root first.
-- When a package is packed, its `prepack` script (`scripts/bundle-shared.mjs`) copies the shared package into that package's own `node_modules` so the archive is self-contained, and `postpack` removes the copy again. npm does not bundle hoisted workspace symlinks on its own.
+- `npm install` at the repository root links the live shared sources into **each consumer's** `node_modules` (also available via `npm run link:shared`). Pi resolves imports from the symlinked extension path, so a hoisted workspace link at the root alone is not sufficient. Local installs (`pi install ./packages/<name>`) and symlinked extensions use these live sources.
+- When a package is packed, its `prepack` script (`scripts/bundle-shared.mjs`) temporarily copies the shared package into that package's own `node_modules` so the archive is self-contained; `postpack` restores the local link. npm does not bundle workspace symlinks on its own.
 
-`scripts/verify-packages.mjs` checks that every consumer bundles the complete shared sources, that no stale copy is left behind, and that each archive loads through Pi's loader from a clean install.
+`scripts/verify-packages.mjs` checks that every consumer bundles the complete shared sources, that the development links remain live, and that each extension loads both through a symlink and from a clean archive install.
 
 ## Diagnostics
 

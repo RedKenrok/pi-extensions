@@ -10,6 +10,8 @@
 		"packages/*"
 	],
 	"scripts": {
+		"postinstall": "node scripts/bundle-shared.mjs --link-all",
+		"link:shared": "node scripts/bundle-shared.mjs --link-all",
 		"ci": "npm run lint && npm run test && npm run test:coverage && node scripts/verify-packages.mjs",
 		"lint": "biome check --error-on-warnings package.json tsconfig.json packages scripts test-support && tsc --noEmit",
 		"lint:fix": "biome check --write package.json tsconfig.json packages scripts test-support && tsc --noEmit",

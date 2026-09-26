@@ -4,29 +4,37 @@
 // root, and `npm pack` does not follow hoisted symlinks when it collects
 // bundleDependencies. Copying the shared package into the consumer's own
 // node_modules just for the duration of the pack makes the tarball
-// self-contained, which a Pi install from an archive needs. Local development
-// keeps resolving through the root symlink, so the copy is removed afterwards
-// to avoid shadowing live sources with a stale snapshot.
-import { cp, mkdir, readdir, rm, rmdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+// self-contained. After packing, restore a package-local symlink: Pi's jiti
+// loader resolves symlinked extension paths from ~/.pi/agent/extensions, not
+// from the real workspace path, so the hoisted root dependency is invisible.
+import { cp, glob, mkdir, readFile, rm, symlink } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 
 const SHARED_NAME = "pi-extensions-shared";
 const sharedRoot = resolve(import.meta.dirname, "../packages/shared");
-const consumerModules = join(process.cwd(), "node_modules");
-const target = join(consumerModules, SHARED_NAME);
+async function linkShared(consumerRoot) {
+	const consumerModules = join(consumerRoot, "node_modules");
+	const target = join(consumerModules, SHARED_NAME);
+	await mkdir(consumerModules, { recursive: true });
+	await rm(target, { recursive: true, force: true });
+	await symlink(relative(consumerModules, sharedRoot), target, "dir");
+}
 
-await rm(target, { recursive: true, force: true });
-
-if (process.argv.includes("--clean")) {
-	// Leave no empty node_modules behind in a package that has no other
-	// package-local dependencies.
-	try {
-		if ((await readdir(consumerModules)).length === 0)
-			await rmdir(consumerModules);
-	} catch (error) {
-		if (error.code !== "ENOENT") throw error;
+if (process.argv.includes("--link-all")) {
+	for await (const manifestPath of glob("packages/*/package.json", {
+		cwd: resolve(import.meta.dirname, ".."),
+	})) {
+		const root = resolve(import.meta.dirname, "..", manifestPath, "..");
+		const manifest = JSON.parse(
+			await readFile(join(root, "package.json"), "utf8"),
+		);
+		if (SHARED_NAME in (manifest.dependencies ?? {})) await linkShared(root);
 	}
+} else if (process.argv.includes("--clean")) {
+	await linkShared(process.cwd());
 } else {
+	const target = join(process.cwd(), "node_modules", SHARED_NAME);
+	await rm(target, { recursive: true, force: true });
 	await mkdir(target, { recursive: true });
 	// Only what the shared manifest publishes: its manifest and sources.
 	await cp(join(sharedRoot, "package.json"), join(target, "package.json"));
