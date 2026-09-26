@@ -11,9 +11,25 @@
 		"README.md"
 	],
 	"scripts": {
-		"test": "node --test --experimental-strip-types tests/*.test.ts",
-		"test:coverage": "node --test --experimental-strip-types --experimental-test-coverage --test-coverage-include=index.ts --test-coverage-lines=85 --test-coverage-functions=65 --test-coverage-branches=60 tests/*.test.ts"
+		"prepack": "node ../../scripts/bundle-shared.mjs",
+		"postpack": "node ../../scripts/bundle-shared.mjs --clean",
+		"test": "node ../../scripts/test.mjs",
+		"test:coverage": "node ../../scripts/test.mjs --coverage"
 	},
+	"testCoverage": {
+		"include": [
+			"index.ts"
+		],
+		"lines": 97,
+		"branches": 94,
+		"functions": 82
+	},
+	"dependencies": {
+		"pi-extensions-shared": "0.1.0"
+	},
+	"bundleDependencies": [
+		"pi-extensions-shared"
+	],
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=0.85.1 <1.0.0"
 	},

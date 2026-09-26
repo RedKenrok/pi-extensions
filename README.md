@@ -7,6 +7,8 @@ This repository is an npm workspace of Pi extension packages I have written for 
 - [`codex-research-tool`](packages/codex-research-tool), which provides the Codex-backed `research` tool.
 - [`pi-notify`](packages/notify), which notifies the terminal when an interactive run is ready for input.
 
+[`pi-extensions-shared`](packages/shared) is not an extension. It holds runtime helpers used by several packages (Codex endpoints and headers, JWT account parsing, SSE framing, bounded body reads, `PI_EXT_DEBUG` diagnostics).
+
 > In addition I also use `pi install npm:@everyx/pi-subagent` and `pi install npm:@everyx/pi-sleep-guard`.
 
 ## Security boundaries
@@ -44,6 +46,19 @@ ln -s "$(pwd)/packages/codex-research-tool" ~/.pi/agent/extensions/codex-researc
 ln -s "$(pwd)/packages/notify" ~/.pi/agent/extensions/notify
 ```
 
+## Shared code
+
+Every extension is installed on its own, so shared runtime code cannot be imported across packages by path. Instead each extension declares `pi-extensions-shared` as a dependency and lists it in `bundleDependencies`:
+
+- In the repository, npm workspaces link it from the root `node_modules`, so local installs (`pi install ./packages/<name>`, which load the package in place) and tests use the live sources. Run `npm install` at the root first.
+- When a package is packed, its `prepack` script (`scripts/bundle-shared.mjs`) copies the shared package into that package's own `node_modules` so the archive is self-contained, and `postpack` removes the copy again. npm does not bundle hoisted workspace symlinks on its own.
+
+`scripts/verify-packages.mjs` checks that every consumer bundles the complete shared sources, that no stale copy is left behind, and that each archive loads through Pi's loader from a clean install.
+
+## Diagnostics
+
+Every package falls back quietly by default: a failed notification, a remote compaction that falls back to native, or an unconvertible page never interrupts Pi. To see why, set `PI_EXT_DEBUG` to a comma-separated list of package names (`fetch-tool`, `codex-compaction`, `codex-research-tool`, `pi-notify`) or `*`. Each enabled package then writes one `[package] reason-code` line to stderr per event. Lines never contain credentials, account IDs, URLs with userinfo, request bodies, or conversation content.
+
 ## Development
 
 Install dependencies and run the shared verification suite from the repository root:
@@ -54,6 +69,8 @@ npm run ci
 ```
 
 `npm run ci` type-checks all packages, runs read-only Biome checks, executes every workspace's tests and coverage thresholds, and verifies local package archives plus isolated consumer installs with exact Pi peers, loads every advertised TypeScript extension entrypoint through Pi's loader, and checks Pi peer dependency resolution. The consumer verifier may fetch dependencies from the configured npm registry but never publishes packages. CI runs the suite on Node 22.19.0 (the declared minimum), 24.x, and 26.x against coherent Pi peer versions 0.85.1 and 0.87.1. The current-version job installs overrides in its ephemeral CI checkout without saving them to the lockfile; local consumers of the verifier are scratch directories. The repository uses one root lockfile and keeps development-only dependencies in the root package.
+
+Tests import shared helpers (deferred promises, JWT and SSE fixtures, an event-loop hold for `AbortSignal.timeout()` waits) from the root `test-support/` directory. It is linted and type-checked with the packages, and the package verifier rejects any archive that contains it.
 
 Additional verification commands:
 

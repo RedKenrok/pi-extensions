@@ -7,9 +7,17 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref makes the older run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # Streaming and cancellation tests can hang rather than fail when they
+    # regress; bound the job so a hang costs minutes, not the 6-hour default.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

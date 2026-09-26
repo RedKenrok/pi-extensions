@@ -1,0 +1,28 @@
+{
+	"name": "pi-extensions-shared",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Runtime helpers bundled into each extension package; not a Pi extension itself.",
+	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"files": [
+		"src/"
+	],
+	"exports": {
+		"./*": "./src/*.ts"
+	},
+	"scripts": {
+		"test": "node ../../scripts/test.mjs",
+		"test:coverage": "node ../../scripts/test.mjs --coverage"
+	},
+	"testCoverage": {
+		"include": [
+			"src/**/*.ts"
+		],
+		"lines": 99,
+		"branches": 99,
+		"functions": 83
+	}
+}

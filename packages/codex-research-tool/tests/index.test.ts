@@ -1,60 +1,84 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
-	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { createResearchExtension } from "../index.ts";
-import { type CodexClient, ResearchError } from "../src/codex.ts";
-import { TOOL_DESCRIPTION } from "../src/search.ts";
+import type { TSchema } from "typebox";
+import { deferred, nextTurn } from "../../../test-support/async.ts";
+import { partialFake } from "../../../test-support/fakes.ts";
+import { createResearchExtension, type ResearchHost } from "../index.ts";
+import {
+	type CodexResearchResult,
+	type ResearchBackend,
+	ResearchError,
+} from "../src/codex.ts";
+import { type createResearchTool, TOOL_DESCRIPTION } from "../src/search.ts";
 
-type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
+// Pi's handlers each expect their own event type, so a fake that stores them
+// side by side can only accept "some event". Emitting casts the event instead.
+type Handler = (event: never, ctx: ExtensionContext) => unknown;
+type CommandOptions = Parameters<ResearchHost["registerCommand"]>[1];
+type ResearchTool = ReturnType<typeof createResearchTool>;
 
-function deferred<T>() {
-	let resolve!: (value: T) => void;
-	let reject!: (reason?: unknown) => void;
-	const promise = new Promise<T>((res, rej) => {
-		resolve = res;
-		reject = rej;
-	});
-	return { promise, resolve, reject };
+const answer: CodexResearchResult = {
+	answer: "answer",
+	citations: [],
+	model: "model",
+	searchActivity: 1,
+};
+
+function backend(overrides: Partial<ResearchBackend> = {}): ResearchBackend {
+	return {
+		invalidateModel() {},
+		selectModel: async () => "model",
+		runResearch: async () => answer,
+		...overrides,
+	};
 }
 
 function harness(options: {
 	credential: () => Record<string, unknown> | undefined;
 	token?: () => Promise<string | undefined>;
-	client?: CodexClient;
+	client?: ResearchBackend;
 }) {
 	const handlers = new Map<string, Handler[]>();
-	const commands = new Map<
-		string,
-		(args: string, ctx: ExtensionContext) => unknown
-	>();
-	const tools = new Map<string, ToolDefinition>();
+	const commands = new Map<string, CommandOptions["handler"]>();
+	const tools = new Map<string, ResearchTool>();
 	let active = ["read", "other_tool"];
 	const notifications: string[] = [];
-	const api = {
+	const api = partialFake<ResearchHost>({
 		on(name: string, handler: Handler) {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+			// Pi 0.87 returns an unsubscribe function from on(); 0.85 returns void,
+			// which a function-returning fake also satisfies.
+			return () => {
+				handlers.set(
+					name,
+					(handlers.get(name) ?? []).filter((entry) => entry !== handler),
+				);
+			};
 		},
-		registerCommand(
-			name: string,
-			definition: { handler: (args: string, ctx: ExtensionContext) => unknown },
-		) {
+		registerCommand(name: string, definition: CommandOptions) {
 			commands.set(name, definition.handler);
 		},
-		registerTool(tool: ToolDefinition) {
-			tools.set(tool.name, tool);
+		registerTool<TParams extends TSchema, TDetails, TState>(
+			tool: ToolDefinition<TParams, TDetails, TState>,
+		) {
+			// Pi's registerTool is generic, so storing tools side by side erases
+			// their parameter types; this extension only registers the research tool.
+			tools.set(tool.name, tool as ToolDefinition as ResearchTool);
 			active = [...new Set([...active, tool.name])];
 		},
 		getActiveTools: () => [...active],
 		setActiveTools(names: string[]) {
 			active = [...names];
 		},
-		getAllTools: () => [...tools.values()],
-	} as unknown as ExtensionAPI;
-	const ctx = {
+	});
+	// Command handlers receive the richer command context; it also satisfies
+	// every event handler, so one fake serves both.
+	const ctx = partialFake<ExtensionCommandContext>({
 		mode: "tui",
 		hasUI: true,
 		ui: {
@@ -66,22 +90,11 @@ function harness(options: {
 			getApiKeyForProvider: options.token ?? (async () => "token"),
 		},
 		model: { provider: "other", id: "conversation" },
-	} as unknown as ExtensionContext;
+	});
 	createResearchExtension({
 		readCredential: () => options.credential() as never,
 		resolveAccessToken: async () => (options.token ? options.token() : "token"),
-		client:
-			options.client ??
-			({
-				invalidateModel() {},
-				selectModel: async () => "model",
-				runResearch: async () => ({
-					answer: "answer",
-					citations: [],
-					model: "model",
-					searchActivity: 1,
-				}),
-			} as unknown as CodexClient),
+		client: options.client ?? backend(),
 	})(api);
 
 	return {
@@ -96,7 +109,7 @@ function harness(options: {
 		},
 		async emit(name: string) {
 			for (const handler of handlers.get(name) ?? [])
-				await handler({ type: name }, ctx);
+				await handler({ type: name } as never, ctx);
 		},
 		async command(args: string) {
 			await commands.get("research")?.(args, ctx);
@@ -217,13 +230,12 @@ test("ordinary checks preserve intentional user deactivation; explicit refresh e
 });
 
 test("backend denial deactivates until explicit refresh and preserves unrelated tools", async () => {
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: async () => "model",
 		runResearch: async () => {
 			throw new ResearchError("access_denied", "denied", false);
 		},
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
@@ -246,8 +258,7 @@ test("backend denial deactivates until explicit refresh and preserves unrelated 
 test("stale availability success cannot override a newer unavailable refresh", async () => {
 	const oldSelection = deferred<string>();
 	let selections = 0;
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: () => {
 			selections += 1;
 			return selections === 1
@@ -256,19 +267,13 @@ test("stale availability success cannot override a newer unavailable refresh", a
 						new ResearchError("client_outdated", "outdated", false),
 					);
 		},
-		runResearch: async () => ({
-			answer: "answer",
-			citations: [],
-			model: "model",
-			searchActivity: 1,
-		}),
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
 	});
 	const initialCheck = runtime.emit("session_start");
-	while (selections < 1) await new Promise((resolve) => setImmediate(resolve));
+	while (selections < 1) await nextTurn();
 	await runtime.command("refresh");
 	assert.equal(runtime.active().includes("research"), false);
 	oldSelection.resolve("model");
@@ -280,8 +285,7 @@ test("a newer availability check aborts and cleans up its predecessor", async ()
 	const oldSelection = deferred<string>();
 	let selections = 0;
 	let oldSignal: AbortSignal | undefined;
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: (_auth: unknown, signal?: AbortSignal) => {
 			selections += 1;
 			if (selections === 1) {
@@ -290,19 +294,13 @@ test("a newer availability check aborts and cleans up its predecessor", async ()
 			}
 			return Promise.resolve("model");
 		},
-		runResearch: async () => ({
-			answer: "answer",
-			citations: [],
-			model: "model",
-			searchActivity: 1,
-		}),
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
 	});
 	const initialCheck = runtime.emit("session_start");
-	while (!oldSignal) await new Promise((resolve) => setImmediate(resolve));
+	while (!oldSignal) await nextTurn();
 
 	await runtime.command("refresh");
 	assert.equal(oldSignal.aborted, true);
@@ -314,25 +312,18 @@ test("a newer availability check aborts and cleans up its predecessor", async ()
 test("session shutdown aborts and cleans up an active availability check", async () => {
 	const selection = deferred<string>();
 	let signal: AbortSignal | undefined;
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: (_auth: unknown, selectionSignal?: AbortSignal) => {
 			signal = selectionSignal;
 			return selection.promise;
 		},
-		runResearch: async () => ({
-			answer: "answer",
-			citations: [],
-			model: "model",
-			searchActivity: 1,
-		}),
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
 	});
 	const initialCheck = runtime.emit("session_start");
-	while (!signal) await new Promise((resolve) => setImmediate(resolve));
+	while (!signal) await nextTurn();
 
 	await runtime.emit("session_shutdown");
 	assert.equal(signal.aborted, true);
@@ -343,8 +334,7 @@ test("session shutdown aborts and cleans up an active availability check", async
 });
 
 test("availability requires a usable backend catalog before registering", async () => {
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: async () => {
 			throw new ResearchError(
 				"client_outdated",
@@ -355,7 +345,7 @@ test("availability requires a usable backend catalog before registering", async 
 		runResearch: async () => {
 			throw new Error("must not run");
 		},
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
@@ -371,7 +361,7 @@ test("availability requires a usable backend catalog before registering", async 
 test("explicit refresh invalidates and rechecks the backend catalog", async () => {
 	let invalidations = 0;
 	let probes = 0;
-	const client = {
+	const client = backend({
 		invalidateModel() {
 			invalidations += 1;
 		},
@@ -379,13 +369,7 @@ test("explicit refresh invalidates and rechecks the backend catalog", async () =
 			probes += 1;
 			return "model";
 		},
-		runResearch: async () => ({
-			answer: "answer",
-			citations: [],
-			model: "model",
-			searchActivity: 1,
-		}),
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
@@ -399,21 +383,15 @@ test("explicit refresh invalidates and rechecks the backend catalog", async () =
 });
 
 test("an old runResearch denial cannot disable a tool after refresh", async () => {
-	const oldRun = deferred<{
-		answer: string;
-		citations: [];
-		model: string;
-		searchActivity: number;
-	}>();
+	const oldRun = deferred<CodexResearchResult>();
 	let runs = 0;
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: async () => "model",
 		runResearch: () => {
 			runs += 1;
 			return oldRun.promise;
 		},
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
@@ -428,7 +406,7 @@ test("an old runResearch denial cannot disable a tool after refresh", async () =
 		undefined,
 		runtime.ctx,
 	);
-	while (runs < 1) await new Promise((resolve) => setImmediate(resolve));
+	while (runs < 1) await nextTurn();
 	await runtime.command("refresh");
 	oldRun.reject(new ResearchError("access_denied", "denied", false));
 	await assert.rejects(execution, ResearchError);
@@ -437,14 +415,13 @@ test("an old runResearch denial cannot disable a tool after refresh", async () =
 
 test("a new runResearch denial after refresh disables the tool", async () => {
 	let runs = 0;
-	const client = {
-		invalidateModel() {},
+	const client = backend({
 		selectModel: async () => "model",
 		runResearch: async () => {
 			runs += 1;
 			throw new ResearchError("access_denied", "denied", false);
 		},
-	} as unknown as CodexClient;
+	});
 	const runtime = harness({
 		credential: () => ({ type: "oauth", accountId: "account" }),
 		client,
@@ -473,12 +450,14 @@ test("reload starts from fresh availability and unsupported Pi fails closed", as
 	await second.emit("session_start");
 	assert.equal(second.tools.has("research"), false);
 
+	// A host whose context lacks the model registry cannot resolve a token.
+	// The extension must stay unregistered instead of throwing or guessing.
 	let registered = false;
-	const api = {
+	let sessionStart: Handler | undefined;
+	const api = partialFake<ResearchHost>({
 		on(name: string, handler: Handler) {
-			if (name === "session_start") {
-				void handler({ type: name }, second.ctx);
-			}
+			if (name === "session_start") sessionStart = handler;
+			return () => {};
 		},
 		registerCommand() {},
 		registerTool() {
@@ -486,7 +465,7 @@ test("reload starts from fresh availability and unsupported Pi fails closed", as
 		},
 		getActiveTools: () => ["read"],
 		setActiveTools() {},
-	} as unknown as ExtensionAPI;
+	});
 	createResearchExtension({
 		readCredential: () => ({
 			type: "oauth",
@@ -495,8 +474,16 @@ test("reload starts from fresh availability and unsupported Pi fails closed", as
 			refresh: "r",
 			expires: 1,
 		}),
+		client: backend({
+			selectModel: async () => {
+				throw new Error("must not reach the backend");
+			},
+		}),
 	})(api);
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await sessionStart?.(
+		{ type: "session_start" } as never,
+		partialFake<ExtensionContext>({ mode: "tui", ui: { notify() {} } }),
+	);
 	assert.equal(registered, false);
 });
 
@@ -515,4 +502,40 @@ test("status is read-only and unknown command arguments show usage", async () =>
 	assert.equal(tokenCalls, afterStart);
 	await runtime.command("wat");
 	assert.match(runtime.notifications.at(-1) ?? "", /Usage:/);
+});
+
+test("repeated availability checks reuse the verified token", async () => {
+	let tokenCalls = 0;
+	const runtime = harness({
+		credential: () => ({ type: "oauth", accountId: "account" }),
+		token: async () => {
+			tokenCalls += 1;
+			return "token";
+		},
+	});
+	await runtime.emit("session_start");
+	await runtime.emit("before_agent_start");
+	await runtime.emit("before_agent_start");
+	assert.equal(tokenCalls, 1);
+	await runtime.command("refresh");
+	assert.equal(tokenCalls, 2, "an explicit refresh always refreshes the token");
+});
+
+test("PI_EXT_DEBUG reports availability reason codes without secrets", async (t) => {
+	const lines: string[] = [];
+	const original = process.env.PI_EXT_DEBUG;
+	process.env.PI_EXT_DEBUG = "other-package, codex-research-tool";
+	t.mock.method(process.stderr, "write", (line: string) => {
+		lines.push(line);
+		return true;
+	});
+	t.after(() => {
+		if (original === undefined) delete process.env.PI_EXT_DEBUG;
+		else process.env.PI_EXT_DEBUG = original;
+	});
+	const runtime = harness({ credential: () => undefined });
+	await runtime.emit("session_start");
+	assert.deepEqual(lines, [
+		"[codex-research-tool] availability:missing_oauth\n",
+	]);
 });

@@ -1,32 +1,73 @@
 import type { Api, Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import {
+	type CompactionResult,
 	compact,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
+	addCumulativeFiles,
+	checkpointCompatible,
+	checkpointFromEntry,
+	latestCompaction,
+	planRemoteCompaction,
+	type RemotePlan,
+	tailIsCompatible,
+} from "./src/branch.ts";
+import {
+	createDebugSink,
+	type DebugSink,
+	type FallbackReason,
+} from "./src/debug.ts";
+import {
 	accountFingerprint,
 	accountIdFromToken,
+	buildCheckpoint,
 	CODEX_BASE_URL,
-	CODEX_RESPONSES_URL,
 	captureCodexInput,
+	isRecord,
 	isTrustedModel,
 	type JsonObject,
-	parseCheckpoint,
 	type RemoteCheckpoint,
 	requestRemoteCompaction,
+	validateTimeoutMs,
 } from "./src/remote.ts";
 
-type AgentMessage =
-	SessionBeforeCompactEvent["preparation"]["messagesToSummarize"][number];
-
+// Pi does not export these from its public entry point. They must match the
+// wrapper Pi's convertToLlm puts around a compaction summary exactly;
+// tests/contract.test.ts checks that against the installed Pi.
 const COMPACTION_SUMMARY_PREFIX =
 	"The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
 
-function isRecord(value: unknown): value is JsonObject {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+const AUTH_RESOLUTION_TIMEOUT_MS = 10_000;
+const DEFAULT_REMOTE_GRACE_MS = 5_000;
+const MAX_REMOTE_GRACE_MS = 60_000;
+
+type AuthRegistry = Pick<
+	ExtensionContext["modelRegistry"],
+	"isUsingOAuth" | "getApiKeyAndHeaders"
+>;
+type ResolvedAuth = Awaited<ReturnType<AuthRegistry["getApiKeyAndHeaders"]>>;
+
+interface Identity {
+	apiKey: string;
+	accountId: string;
+	fingerprint: string;
+	headers?: Record<string, string>;
+	env?: Record<string, string>;
+}
+
+export function summaryItem(item: unknown, summary: string): boolean {
+	if (!isRecord(item) || item.role !== "user" || !Array.isArray(item.content))
+		return false;
+	if (item.type !== undefined && item.type !== "message") return false;
+	const expected =
+		COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX;
+	if (item.content.length !== 1) return false;
+	const part = item.content[0];
+	return isRecord(part) && part.type === "input_text" && part.text === expected;
 }
 
 function stringHeaders(
@@ -39,202 +80,41 @@ function stringHeaders(
 	return entries.length ? Object.fromEntries(entries) : undefined;
 }
 
-function checkpointFromEntry(
-	entry: unknown,
-):
-	| { state: "none" }
-	| { state: "invalid" }
-	| { state: "valid"; checkpoint: RemoteCheckpoint } {
-	if (!isRecord(entry) || entry.type !== "compaction") return { state: "none" };
-	if (!isRecord(entry.details) || !("remoteCompaction" in entry.details))
-		return { state: "invalid" };
-	const checkpoint = parseCheckpoint(entry.details.remoteCompaction);
-	return checkpoint ? { state: "valid", checkpoint } : { state: "invalid" };
-}
-
-function latestCompaction(branch: unknown[]): unknown {
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const entry = branch[index];
-		if (isRecord(entry) && entry.type === "compaction") return entry;
-	}
-	return undefined;
-}
-
-function summaryItem(item: unknown, summary: string): boolean {
-	if (!isRecord(item) || item.role !== "user" || !Array.isArray(item.content))
-		return false;
-	if (item.type !== undefined && item.type !== "message") return false;
-	const expected =
-		COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX;
-	if (item.content.length !== 1) return false;
-	const part = item.content[0];
-	return isRecord(part) && part.type === "input_text" && part.text === expected;
-}
-
-const AUTH_RESOLUTION_TIMEOUT_MS = 10_000;
-
-async function identity(
-	ctx: ExtensionContext,
-	model: Model<Api>,
+/**
+ * Resolves to undefined when the signal aborts or the deadline passes. The
+ * underlying promise cannot be cancelled and keeps running; callers share it
+ * instead of starting another one (see resolveShared below).
+ */
+function settleWithin<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
 	signal?: AbortSignal,
-): Promise<
-	| {
-			apiKey: string;
-			accountId: string;
-			fingerprint: string;
-			headers?: Record<string, string>;
-			env?: Record<string, string>;
-	  }
-	| undefined
-> {
-	if (
-		!isTrustedModel(model) ||
-		!ctx.modelRegistry.isUsingOAuth(model) ||
-		signal?.aborted
-	)
-		return undefined;
-	// The registry resolver is not required to accept an AbortSignal. Race it
-	// against both lifecycle cancellation and a hard bound. Resolver failures are
-	// deliberately converted to the native-compaction fallback, and the finally
-	// block also cleans up when the race itself rejects or is cancelled.
-	const pending = Promise.resolve().then(async () => {
-		if (signal?.aborted) return undefined;
-		try {
-			return await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		} catch {
-			return undefined;
-		}
-	});
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let onAbort: (() => void) | undefined;
-	const cancelled = new Promise<undefined>((resolve) => {
-		onAbort = () => resolve(undefined);
-		if (signal?.aborted) onAbort();
-		else signal?.addEventListener("abort", onAbort, { once: true });
-	});
-	const timeout = new Promise<undefined>((resolve) => {
-		timer = setTimeout(() => resolve(undefined), AUTH_RESOLUTION_TIMEOUT_MS);
-	});
-	try {
-		const resolved = await Promise.race([pending, cancelled, timeout]);
-		if (signal?.aborted || !resolved?.ok || !resolved.apiKey) return undefined;
-		if (
-			resolved.baseUrl !== undefined &&
-			resolved.baseUrl.replace(/\/+$/, "") !== CODEX_BASE_URL
-		)
-			return undefined;
-		const accountId = accountIdFromToken(resolved.apiKey);
-		if (!accountId) return undefined;
-		const headers = stringHeaders(resolved.headers);
-		return {
-			apiKey: resolved.apiKey,
-			accountId,
-			fingerprint: accountFingerprint(accountId),
-			...(headers ? { headers } : {}),
-			...(resolved.env ? { env: resolved.env } : {}),
+): Promise<T | undefined> {
+	if (signal?.aborted) return Promise.resolve(undefined);
+	return new Promise((resolve) => {
+		const finish = (value: T | undefined) => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(value);
 		};
-	} finally {
-		if (timer) clearTimeout(timer);
-		if (onAbort) signal?.removeEventListener("abort", onAbort);
-	}
+		const onAbort = () => finish(undefined);
+		const timer = setTimeout(() => finish(undefined), timeoutMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		promise.then(finish, () => finish(undefined));
+	});
 }
 
-function checkpointCompatible(
-	checkpoint: RemoteCheckpoint,
-	model: Model<Api>,
-	fingerprint: string,
-): boolean {
-	return (
-		checkpoint.model === model.id &&
-		checkpoint.accountFingerprint === fingerprint &&
-		checkpoint.endpoint === CODEX_RESPONSES_URL &&
-		checkpoint.api === model.api
-	);
-}
-
-function addCumulativeFiles(
-	fileOps: { read: Set<string>; written: Set<string>; edited: Set<string> },
-	entry: unknown,
-): void {
-	if (isRecord(entry) && isRecord(entry.details)) {
-		if (Array.isArray(entry.details.readFiles)) {
-			for (const path of entry.details.readFiles)
-				if (typeof path === "string") fileOps.read.add(path);
-		}
-		if (Array.isArray(entry.details.modifiedFiles)) {
-			for (const path of entry.details.modifiedFiles)
-				if (typeof path === "string") fileOps.edited.add(path);
-		}
-	}
-}
-
-function preparationWithCumulativeFiles<
-	T extends {
-		fileOps: { read: Set<string>; written: Set<string>; edited: Set<string> };
-	},
->(preparation: T, entry: unknown): T {
-	const fileOps = {
-		read: new Set(preparation.fileOps.read),
-		written: new Set(preparation.fileOps.written),
-		edited: new Set(preparation.fileOps.edited),
+function withFallbackReason(
+	result: CompactionResult,
+	reason: FallbackReason,
+): CompactionResult {
+	return {
+		...result,
+		details: {
+			...(isRecord(result.details) ? result.details : {}),
+			fallbackReason: reason,
+		},
 	};
-	addCumulativeFiles(fileOps, entry);
-	return { ...preparation, fileOps };
-}
-
-function tailIsCompatible(
-	branch: unknown[],
-	compactionEntry: unknown,
-	model: Model<Api>,
-): boolean {
-	if (!isRecord(compactionEntry)) return false;
-	const index = branch.indexOf(compactionEntry);
-	const id = compactionEntry.id;
-	const firstKeptEntryId = compactionEntry.firstKeptEntryId;
-	if (
-		index < 0 ||
-		typeof id !== "string" ||
-		typeof firstKeptEntryId !== "string"
-	)
-		return false;
-	const compactionIdMatches = branch.filter(
-		(entry) => isRecord(entry) && entry.id === id,
-	);
-	const firstKeptMatches = branch.filter(
-		(entry) => isRecord(entry) && entry.id === firstKeptEntryId,
-	);
-	const firstKeptIndex = branch.findIndex(
-		(entry) => isRecord(entry) && entry.id === firstKeptEntryId,
-	);
-	// Pi uses the compaction's own ID for retain-none compactions, so equality
-	// is valid; duplicate boundary IDs are not.
-	if (
-		compactionIdMatches.length !== 1 ||
-		firstKeptMatches.length !== 1 ||
-		firstKeptIndex < 0 ||
-		firstKeptIndex > index
-	)
-		return false;
-	const retainedAndTail = [
-		...branch.slice(firstKeptIndex, index),
-		...branch.slice(index + 1),
-	];
-	for (const entry of retainedAndTail) {
-		if (
-			!isRecord(entry) ||
-			entry.type !== "message" ||
-			!isRecord(entry.message) ||
-			entry.message.role !== "assistant"
-		)
-			continue;
-		if (
-			entry.message.provider !== model.provider ||
-			entry.message.model !== model.id ||
-			entry.message.api !== model.api
-		)
-			return false;
-	}
-	return true;
 }
 
 export interface CodexCompactionDependencies {
@@ -242,219 +122,344 @@ export interface CodexCompactionDependencies {
 	timeoutMs?: number;
 	remoteGraceMs?: number;
 	nativeCompact?: typeof compact;
+	/** Receives fallback reason codes; defaults to stderr when PI_EXT_DEBUG enables this package. */
+	debug?: DebugSink;
 }
-
-const DEFAULT_REMOTE_GRACE_MS = 5_000;
 
 export function createCodexCompactionExtension(
 	dependencies: CodexCompactionDependencies = {},
 ) {
+	const graceMs = dependencies.remoteGraceMs ?? DEFAULT_REMOTE_GRACE_MS;
+	if (
+		!Number.isInteger(graceMs) ||
+		graceMs < 0 ||
+		graceMs > MAX_REMOTE_GRACE_MS
+	)
+		throw new RangeError(
+			`remoteGraceMs must be an integer from 0 to ${MAX_REMOTE_GRACE_MS}`,
+		);
+	if (dependencies.timeoutMs !== undefined)
+		validateTimeoutMs(dependencies.timeoutMs);
+
 	return (pi: ExtensionAPI): void => {
+		// Pi's native compact() and this extension's payload capture both bypass
+		// Pi's before_provider_request hook, and Pi rejects prompts while a
+		// compaction runs. The counter is therefore a defensive guard: nothing
+		// should be replayed from a checkpoint that is about to be superseded.
+		// Pi builds one extension instance per session runner, so a plain
+		// counter is already scoped to one session.
 		let suppressReplay = 0;
 		const runNativeCompact = dependencies.nativeCompact ?? compact;
+		const debug = dependencies.debug ?? createDebugSink();
+		const pendingResolutions = new Map<
+			string,
+			Promise<ResolvedAuth | undefined>
+		>();
+		let lastAccount:
+			| { apiKey: string; accountId: string; fingerprint: string }
+			| undefined;
+		let replayCache:
+			| {
+					key: string;
+					checkpoint: RemoteCheckpoint | undefined;
+					summary: string | undefined;
+			  }
+			| undefined;
+
+		const fallback = (reason: FallbackReason): undefined => {
+			debug(reason);
+			return undefined;
+		};
+
+		// The registry resolver is not required to accept an AbortSignal, so a
+		// timed-out resolution may still be running. Sharing it prevents every
+		// later request from stacking another background resolution.
+		const resolveShared = (
+			registry: AuthRegistry,
+			model: Model<Api>,
+		): Promise<ResolvedAuth | undefined> => {
+			const key = `${model.provider}\u0000${model.id}`;
+			let pending = pendingResolutions.get(key);
+			if (!pending) {
+				pending = Promise.resolve()
+					.then(() => registry.getApiKeyAndHeaders(model))
+					.catch(() => undefined)
+					.finally(() => pendingResolutions.delete(key));
+				pendingResolutions.set(key, pending);
+			}
+			return pending;
+		};
+
+		const accountFor = (apiKey: string) => {
+			if (lastAccount?.apiKey === apiKey) return lastAccount;
+			const accountId = accountIdFromToken(apiKey);
+			if (!accountId) return undefined;
+			lastAccount = {
+				apiKey,
+				accountId,
+				fingerprint: accountFingerprint(accountId),
+			};
+			return lastAccount;
+		};
+
+		// Resolver failures are deliberately converted to the native-compaction
+		// fallback rather than surfaced, since native compaction still works.
+		const identity = async (
+			registry: AuthRegistry,
+			model: Model<Api>,
+			signal?: AbortSignal,
+		): Promise<Identity | undefined> => {
+			if (
+				!isTrustedModel(model) ||
+				!registry.isUsingOAuth(model) ||
+				signal?.aborted
+			)
+				return undefined;
+			const resolved = await settleWithin(
+				resolveShared(registry, model),
+				AUTH_RESOLUTION_TIMEOUT_MS,
+				signal,
+			);
+			if (signal?.aborted || !resolved?.ok || !resolved.apiKey)
+				return undefined;
+			if (
+				resolved.baseUrl !== undefined &&
+				resolved.baseUrl.replace(/\/+$/, "") !== CODEX_BASE_URL
+			)
+				return undefined;
+			const account = accountFor(resolved.apiKey);
+			if (!account) return undefined;
+			const headers = stringHeaders(resolved.headers);
+			return {
+				apiKey: resolved.apiKey,
+				accountId: account.accountId,
+				fingerprint: account.fingerprint,
+				...(headers ? { headers } : {}),
+				...(resolved.env ? { env: resolved.env } : {}),
+			};
+		};
+
+		const runHybrid = async (
+			plan: Extract<RemotePlan, { ok: true }>,
+			auth: Identity,
+			event: SessionBeforeCompactEvent,
+			ctx: ExtensionContext,
+		) => {
+			const { model } = plan;
+			const remoteController = new AbortController();
+			const remoteSignal = AbortSignal.any([
+				event.signal,
+				remoteController.signal,
+			]);
+			let usage: JsonObject | undefined;
+			const nativePromise = runNativeCompact(
+				event.preparation,
+				model,
+				auth.apiKey,
+				auth.headers,
+				undefined,
+				event.signal,
+				ctx.thinkingLevel,
+				undefined,
+				auth.env,
+			);
+			const remotePromise = (async () => {
+				const active = new Set(pi.getActiveTools());
+				const tools = pi
+					.getAllTools()
+					.filter((tool) => active.has(tool.name))
+					.map((tool) => ({
+						name: tool.name,
+						description: tool.description,
+						parameters: tool.parameters,
+					}));
+				const captured = await captureCodexInput(
+					model,
+					plan.discarded,
+					auth.apiKey,
+					{
+						signal: remoteSignal,
+						systemPrompt: ctx.getSystemPrompt(),
+						tools,
+						...(ctx.thinkingLevel && ctx.thinkingLevel !== "off"
+							? { reasoning: ctx.thinkingLevel }
+							: {}),
+					},
+				);
+				return requestRemoteCompaction(
+					captured.template,
+					plan.prior ? [plan.prior.item, ...captured.input] : captured.input,
+					{ accessToken: auth.apiKey, accountId: auth.accountId },
+					{
+						...(auth.headers ? { headers: auth.headers } : {}),
+						...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+						...(dependencies.timeoutMs !== undefined
+							? { timeoutMs: dependencies.timeoutMs }
+							: {}),
+						signal: remoteSignal,
+						onUsage: (value) => {
+							usage = value;
+						},
+					},
+				);
+			})();
+			// Attaching both handlers immediately means an early remote rejection
+			// is never reported as unhandled while native compaction is pending.
+			const settledRemote = remotePromise.then(
+				(value) => ({ status: "fulfilled" as const, value }),
+				() => ({ status: "rejected" as const }),
+			);
+			const native = await nativePromise.then(
+				(value) => ({ ok: true as const, value }),
+				() => ({ ok: false as const }),
+			);
+			if (event.signal.aborted) {
+				remoteController.abort(event.signal.reason);
+				return fallback("aborted");
+			}
+			if (!native.ok) {
+				remoteController.abort(new Error("Native compaction failed"));
+				return fallback("native_failed");
+			}
+			let graceTimer: ReturnType<typeof setTimeout> | undefined;
+			const remote = await Promise.race([
+				settledRemote,
+				new Promise<{ status: "timeout" }>((resolve) => {
+					graceTimer = setTimeout(
+						() => resolve({ status: "timeout" }),
+						graceMs,
+					);
+				}),
+			]);
+			clearTimeout(graceTimer);
+			if (event.signal.aborted) {
+				remoteController.abort(event.signal.reason);
+				return fallback("aborted");
+			}
+			if (remote.status !== "fulfilled") {
+				remoteController.abort(
+					new DOMException(
+						"Remote compaction grace period elapsed",
+						"TimeoutError",
+					),
+				);
+				const reason =
+					remote.status === "timeout"
+						? "remote_grace_elapsed"
+						: "remote_failed";
+				debug(reason);
+				return { compaction: withFallbackReason(native.value, reason) };
+			}
+			return {
+				compaction: {
+					...native.value,
+					details: {
+						...(isRecord(native.value.details) ? native.value.details : {}),
+						remoteCompaction: buildCheckpoint(
+							model.id,
+							auth.fingerprint,
+							remote.value,
+							usage,
+						),
+					},
+				},
+			};
+		};
 
 		pi.on("session_before_compact", async (event, ctx) => {
 			const latest = latestCompaction(event.branchEntries);
 			const prior = checkpointFromEntry(latest);
-			// Pi skips cumulative details from extension-created compactions. Restore
-			// only this extension's validated checkpoint metadata before delegating.
-			if (prior.state === "valid")
-				addCumulativeFiles(event.preparation.fileOps, latest);
-			if (event.customInstructions !== undefined) return;
-			const model = ctx.model;
-			if (!model) return;
-			const auth = await identity(ctx, model, event.signal);
-			if (event.signal.aborted || !auth) return;
-
-			// A previous readable summary without a usable opaque checkpoint means that
-			// remote compaction would silently forget already-discarded history.
-			if (event.preparation.previousSummary && prior.state !== "valid") return;
-			if (prior.state === "invalid") return;
+			if (prior.state === "valid" && latest)
+				addCumulativeFiles(event.preparation.fileOps, latest.entry);
+			const plan = planRemoteCompaction(event, ctx.model, latest, prior);
+			if (!plan.ok) return fallback(plan.reason);
+			const auth = await identity(ctx.modelRegistry, plan.model, event.signal);
+			if (event.signal.aborted) return fallback("aborted");
+			if (!auth) return fallback("auth_unavailable");
 			if (
-				prior.state === "valid" &&
-				(!checkpointCompatible(prior.checkpoint, model, auth.fingerprint) ||
-					!tailIsCompatible(event.branchEntries, latest, model))
+				plan.prior &&
+				!checkpointCompatible(plan.prior, plan.model, auth.fingerprint)
 			)
-				return;
-
-			const nativePreparation = preparationWithCumulativeFiles(
-				event.preparation,
-				latest,
-			);
-			const discarded: AgentMessage[] = [
-				...event.preparation.messagesToSummarize,
-				...(event.preparation.isSplitTurn
-					? event.preparation.turnPrefixMessages
-					: []),
-			];
-			if (discarded.length === 0) return;
-
+				return fallback("checkpoint_incompatible");
 			suppressReplay += 1;
-			const remoteController = new AbortController();
-			const abortRemote = () => remoteController.abort(event.signal.reason);
-			if (event.signal.aborted) abortRemote();
-			else event.signal.addEventListener("abort", abortRemote, { once: true });
 			try {
-				const nativePromise = runNativeCompact(
-					nativePreparation,
-					model,
-					auth.apiKey,
-					auth.headers,
-					undefined,
-					event.signal,
-					ctx.thinkingLevel,
-					undefined,
-					auth.env,
-				);
-				const remotePromise = (async () => {
-					const active = new Set(pi.getActiveTools());
-					const tools = pi
-						.getAllTools()
-						.filter((tool) => active.has(tool.name))
-						.map((tool) => ({
-							name: tool.name,
-							description: tool.description,
-							parameters: tool.parameters,
-						}));
-					const captured = await captureCodexInput(
-						model,
-						discarded,
-						auth.apiKey,
-						{
-							signal: remoteController.signal,
-							systemPrompt: ctx.getSystemPrompt(),
-							tools,
-							...(ctx.thinkingLevel && ctx.thinkingLevel !== "off"
-								? { reasoning: ctx.thinkingLevel }
-								: {}),
-						},
-					);
-					const remoteInput =
-						prior.state === "valid"
-							? [prior.checkpoint.item, ...captured.input]
-							: captured.input;
-					const item = await requestRemoteCompaction(
-						captured.template,
-						remoteInput,
-						{ accessToken: auth.apiKey, accountId: auth.accountId },
-						{
-							...(auth.headers ? { headers: auth.headers } : {}),
-							...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
-							...(dependencies.timeoutMs !== undefined
-								? { timeoutMs: dependencies.timeoutMs }
-								: {}),
-							signal: remoteController.signal,
-						},
-					);
-					return item;
-				})();
-				const settledRemotePromise = remotePromise.then(
-					(value) => ({ status: "fulfilled" as const, value }),
-					(reason: unknown) => ({ status: "rejected" as const, reason }),
-				);
-				const native = await Promise.allSettled([nativePromise]).then(
-					([result]) => result,
-				);
-				if (event.signal.aborted || native.status !== "fulfilled") {
-					remoteController.abort(event.signal.reason);
-					void remotePromise.catch(() => undefined);
-					return;
-				}
-				const graceMs = dependencies.remoteGraceMs ?? DEFAULT_REMOTE_GRACE_MS;
-				if (
-					!Number.isFinite(graceMs) ||
-					!Number.isInteger(graceMs) ||
-					graceMs < 0 ||
-					graceMs > 60_000
-				) {
-					remoteController.abort(
-						new RangeError("remoteGraceMs must be an integer from 0 to 60000"),
-					);
-					void remotePromise.catch(() => undefined);
-					return { compaction: native.value };
-				}
-				let graceTimer: ReturnType<typeof setTimeout> | undefined;
-				const remote = await Promise.race([
-					settledRemotePromise,
-					new Promise<{ status: "timeout" }>((resolve) => {
-						graceTimer = setTimeout(
-							() => resolve({ status: "timeout" }),
-							graceMs,
-						);
-					}),
-				]);
-				if (graceTimer) clearTimeout(graceTimer);
-				if (event.signal.aborted) return;
-				if (remote.status !== "fulfilled") {
-					remoteController.abort(
-						new DOMException(
-							"Remote compaction grace period elapsed",
-							"TimeoutError",
-						),
-					);
-					void remotePromise.catch(() => undefined);
-					return { compaction: native.value };
-				}
-				return {
-					compaction: {
-						...native.value,
-						details: {
-							...(isRecord(native.value.details) ? native.value.details : {}),
-							remoteCompaction: {
-								version: 1,
-								provider: "openai-codex",
-								api: "openai-codex-responses",
-								model: model.id,
-								endpoint: CODEX_RESPONSES_URL,
-								authMode: "oauth",
-								accountFingerprint: auth.fingerprint,
-								item: remote.value,
-							},
-						},
-					},
-				};
+				return await runHybrid(plan, auth, event, ctx);
 			} finally {
-				event.signal.removeEventListener("abort", abortRemote);
 				suppressReplay -= 1;
 			}
 		});
 
-		pi.on("before_provider_request", async (event, ctx) => {
-			if (
-				suppressReplay > 0 ||
-				!ctx.model ||
-				!isRecord(event.payload) ||
-				!Array.isArray(event.payload.input)
-			)
-				return;
-			const model = ctx.model;
-			const branch = ctx.sessionManager.getBranch();
-			const entry = latestCompaction(branch);
-			const parsed = checkpointFromEntry(entry);
+		// The branch is a root-to-leaf path, so the leaf id plus length and the
+		// active model fully determine whether the latest checkpoint may be
+		// replayed. Entries without an id are not cached.
+		const replayable = (
+			branch: readonly unknown[],
+			model: Model<Api>,
+		): { checkpoint: RemoteCheckpoint; summary: string } | undefined => {
+			const leaf = branch.at(-1);
+			const leafId =
+				isRecord(leaf) && typeof leaf.id === "string" ? leaf.id : undefined;
+			const key =
+				leafId === undefined
+					? undefined
+					: [leafId, branch.length, model.provider, model.id, model.api].join(
+							"\u0000",
+						);
+			if (key !== undefined && replayCache?.key === key)
+				return replayCache.checkpoint && replayCache.summary !== undefined
+					? { checkpoint: replayCache.checkpoint, summary: replayCache.summary }
+					: undefined;
+			const latest = latestCompaction(branch);
+			const parsed = checkpointFromEntry(latest);
 			// Deliberately do not search older entries: a latest malformed or native
 			// checkpoint is a hard replay boundary.
-			if (parsed.state !== "valid" || !tailIsCompatible(branch, entry, model))
-				return;
-			if (event.payload.model !== model.id) return;
-			const auth = await identity(ctx, model);
+			const usable =
+				parsed.state === "valid" &&
+				latest !== undefined &&
+				typeof latest.entry.summary === "string" &&
+				tailIsCompatible(branch, latest, model)
+					? {
+							checkpoint: parsed.checkpoint,
+							summary: latest.entry.summary as string,
+						}
+					: undefined;
+			if (key !== undefined)
+				replayCache = {
+					key,
+					checkpoint: usable?.checkpoint,
+					summary: usable?.summary,
+				};
+			return usable;
+		};
+
+		pi.on("before_provider_request", async (event, ctx) => {
+			const model = ctx.model;
 			if (
-				!auth ||
-				!checkpointCompatible(parsed.checkpoint, model, auth.fingerprint)
+				suppressReplay > 0 ||
+				!model ||
+				!isRecord(event.payload) ||
+				!Array.isArray(event.payload.input) ||
+				event.payload.model !== model.id
 			)
 				return;
-			if (!isRecord(entry) || typeof entry.summary !== "string") return;
-			const summaryIndexes = event.payload.input.flatMap((item, index) =>
-				summaryItem(item, entry.summary as string) ? [index] : [],
+			const usable = replayable(ctx.sessionManager.getBranch(), model);
+			if (!usable) return;
+			const auth = await identity(ctx.modelRegistry, model);
+			if (
+				!auth ||
+				!checkpointCompatible(usable.checkpoint, model, auth.fingerprint)
+			)
+				return;
+			const input = event.payload.input;
+			const summaryIndexes = input.flatMap((item, index) =>
+				summaryItem(item, usable.summary) ? [index] : [],
 			);
+			// Pi places the summary first; anything else means another extension
+			// reshaped the payload and the substitution can no longer be proved safe.
 			if (summaryIndexes.length !== 1 || summaryIndexes[0] !== 0) return;
-			const index = 0;
 			const replacement: JsonObject = {
 				...event.payload,
-				input: [
-					...event.payload.input.slice(0, index),
-					structuredClone(parsed.checkpoint.item),
-					...event.payload.input.slice(index + 1),
-				],
+				input: [structuredClone(usable.checkpoint.item), ...input.slice(1)],
 			};
 			delete replacement.previous_response_id;
 			return replacement;

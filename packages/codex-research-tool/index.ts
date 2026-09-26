@@ -4,52 +4,45 @@ import {
 	type ExtensionContext,
 	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import { AuthAdapter } from "./src/auth.ts";
+import { AuthAdapter, type AuthUnavailableReason } from "./src/auth.ts";
 import {
 	CODEX_CLIENT_VERSION,
 	CodexClient,
+	type ResearchBackend,
+} from "./src/codex.ts";
+import {
+	AVAILABILITY_MESSAGES,
 	ResearchError,
 	type ResearchErrorCode,
-} from "./src/codex.ts";
+} from "./src/errors.ts";
+import {
+	initialLifecycleState,
+	type LifecycleEffect,
+	type LifecycleEvent,
+	statusText,
+	transition,
+} from "./src/lifecycle.ts";
+import { AVAILABILITY_TIMEOUT_MS } from "./src/limits.ts";
 import { createResearchTool, TOOL_NAME } from "./src/search.ts";
+import { diagnose } from "./src/util.ts";
 
-type Availability =
-	| { kind: "unchecked" }
-	| { kind: "ready" }
-	| { kind: "unavailable"; message: string };
+// These reasons mean the stored login itself is unusable, so the cached
+// verification must not outlive them.
+const CREDENTIAL_FAILURES: ReadonlySet<AuthUnavailableReason> = new Set([
+	"missing_oauth",
+	"refresh_failed",
+	"missing_account_id",
+]);
 
-function removeResearch(pi: ExtensionAPI): void {
-	const active = pi.getActiveTools();
-	if (active.includes(TOOL_NAME)) {
-		pi.setActiveTools(active.filter((name) => name !== TOOL_NAME));
-	}
-}
-
-function enableResearch(pi: ExtensionAPI): void {
-	const active = pi.getActiveTools();
-	if (!active.includes(TOOL_NAME)) {
-		pi.setActiveTools([...active, TOOL_NAME]);
-	}
-}
-
-function statusText(
-	availability: Availability,
-	blockedUntilRefresh: boolean,
-): string {
-	if (blockedUntilRefresh && availability.kind === "unavailable") {
-		return `Research: ${availability.message}`;
-	}
-	if (blockedUntilRefresh) {
-		return "Research: unavailable after a backend authentication, access, or compatibility failure. Run /research refresh after resolving it.";
-	}
-	if (availability.kind === "ready") {
-		return "Research: Ready (Pi Codex subscription); credentials and backend model access are verified.";
-	}
-	if (availability.kind === "unavailable") {
-		return `Research: ${availability.message}`;
-	}
-	return "Research: authentication has not been checked yet.";
-}
+/** The Pi extension API members this extension uses. */
+export type ResearchHost = Pick<
+	ExtensionAPI,
+	| "on"
+	| "registerCommand"
+	| "registerTool"
+	| "getActiveTools"
+	| "setActiveTools"
+>;
 
 export interface ResearchExtensionDependencies {
 	codexClientVersion?: string;
@@ -58,31 +51,20 @@ export interface ResearchExtensionDependencies {
 		ctx: ExtensionContext | undefined,
 		signal?: AbortSignal,
 	) => Promise<string | undefined>;
-	client?: CodexClient;
+	client?: ResearchBackend;
 }
 
 export function createResearchExtension(
 	dependencies: ResearchExtensionDependencies = {},
-): (pi: ExtensionAPI) => void {
-	return (pi: ExtensionAPI): void => {
-		let generation = 0;
-		let availabilityCheckToken = 0;
-		let registered = false;
-		let registeredGeneration = 0;
-		let availability: Availability = { kind: "unchecked" };
-		let blockedUntilRefresh = false;
-		let disabledByExtension = false;
-		let lastNotice: string | undefined;
+): (pi: ResearchHost) => void {
+	return (pi: ResearchHost): void => {
+		let state = initialLifecycleState;
 		let lastContext: ExtensionContext | undefined;
+		let activeCheck: AbortController | undefined;
 		const runtimeController = new AbortController();
+		// Tool calls remember the generation they started in, so a late failure
+		// from a call made before a refresh cannot disable the refreshed tool.
 		const executionGeneration = new AsyncLocalStorage<number>();
-		let activeAvailabilityCheck:
-			| {
-					controller: AbortController;
-					timeout: ReturnType<typeof setTimeout>;
-					onRuntimeAbort: () => void;
-			  }
-			| undefined;
 		const client =
 			dependencies.client ??
 			new CodexClient({
@@ -99,233 +81,172 @@ export function createResearchExtension(
 						: Promise.resolve(undefined),
 		});
 
-		const cleanupAvailabilityCheck = (
-			check: NonNullable<typeof activeAvailabilityCheck>,
-		): void => {
-			clearTimeout(check.timeout);
-			runtimeController.signal.removeEventListener(
-				"abort",
-				check.onRuntimeAbort,
-			);
-			if (activeAvailabilityCheck === check)
-				activeAvailabilityCheck = undefined;
+		const notice = (message: string, level: "info" | "warning"): void => {
+			const ctx = lastContext;
+			if (ctx?.mode === "tui") ctx.ui.notify(message, level);
+			else console.error(message);
 		};
 
-		const abortAvailabilityCheck = (reason: unknown): void => {
-			const check = activeAvailabilityCheck;
-			if (!check) return;
-			cleanupAvailabilityCheck(check);
-			check.controller.abort(reason);
-		};
-
-		const notice = (
-			ctx: ExtensionContext,
-			message: string,
-			type: "info" | "warning" | "error" = "warning",
-		): void => {
-			if (lastNotice === message) return;
-			lastNotice = message;
-			if (ctx.mode === "tui") {
-				ctx.ui.notify(message, type);
-			} else {
-				console.error(message);
+		const setActive = (enabled: boolean): void => {
+			const active = pi.getActiveTools();
+			if (enabled && !active.includes(TOOL_NAME)) {
+				pi.setActiveTools([...active, TOOL_NAME]);
+			} else if (!enabled && active.includes(TOOL_NAME)) {
+				pi.setActiveTools(active.filter((name) => name !== TOOL_NAME));
 			}
 		};
 
-		const deactivate = (
-			ctx: ExtensionContext,
-			message: string,
-			block: boolean,
-		): void => {
-			if (registered) removeResearch(pi);
-			disabledByExtension = true;
-			if (block) blockedUntilRefresh = true;
-			notice(ctx, message, "warning");
-		};
-
-		const backendMessage = (code: ResearchErrorCode): string => {
-			if (code === "access_denied") {
-				return "Research access was denied for this account. Run /research refresh after access is restored.";
-			}
-			if (code === "client_outdated") {
-				return "Research is unavailable because the Codex compatibility version may be outdated. Update codex-research-tool, then run /research refresh.";
-			}
-			if (code === "auth_required") {
-				return "Research needs you to sign in again. Run /login openai-codex, then /research refresh.";
-			}
-			if (code === "rate_limited") {
-				return "Research availability is rate limited. Run /research refresh after the cooldown.";
-			}
-			if (code === "network" || code === "timeout" || code === "cancelled") {
-				return "Research could not verify Codex backend availability. Check the connection, then run /research refresh.";
-			}
-			return "Research is incompatible with the current Codex backend. Update codex-research-tool or Pi, then run /research refresh.";
-		};
-
-		const registerOnce = (ctx: ExtensionContext): void => {
-			if (registered) return;
+		const register = (): void => {
 			const tool = createResearchTool({
 				authCheck: (signal) =>
-					auth.check({ ...(signal ? { signal } : {}), timeoutMs: 5_000 }),
+					auth.check({
+						...(signal ? { signal } : {}),
+						timeoutMs: AVAILABILITY_TIMEOUT_MS,
+					}),
 				client,
 				runtimeSignal: runtimeController.signal,
 				onUnavailable(reason, code) {
-					if (
-						(executionGeneration.getStore() ?? registeredGeneration) !==
-							generation ||
-						runtimeController.signal.aborted
-					)
-						return;
-					const current = lastContext ?? ctx;
-					const message = backendMessage(code ?? "backend_incompatible");
-					availability = {
-						kind: "unavailable",
-						message,
-					};
-					if (reason === "credentials" || code === "auth_required")
-						auth.invalidate();
-					deactivate(
-						current,
-						message,
-						reason === "backend" && code !== "auth_required",
-					);
+					const errorCode: ResearchErrorCode = code ?? "backend_incompatible";
+					diagnose(`tool:unavailable:${errorCode}`);
+					void dispatch({
+						type: "tool_unavailable",
+						generation:
+							executionGeneration.getStore() ?? state.registeredGeneration,
+						message: AVAILABILITY_MESSAGES[errorCode],
+						block: reason === "backend" && errorCode !== "auth_required",
+						invalidateAuth:
+							reason === "credentials" || errorCode === "auth_required",
+					});
 				},
 			});
-			const originalExecute = tool.execute;
+			const execute = tool.execute;
 			pi.registerTool({
 				...tool,
 				execute: (...args) =>
-					executionGeneration.run(registeredGeneration, () =>
-						originalExecute(...args),
+					executionGeneration.run(state.registeredGeneration, () =>
+						execute(...args),
 					),
 			});
-			registered = true;
-			registeredGeneration = generation;
-			enableResearch(pi);
-			disabledByExtension = false;
 		};
 
-		const checkAvailability = async (
+		// Returns the started check, if any, so callers can await its outcome.
+		const perform = (effect: LifecycleEffect): Promise<void> | undefined => {
+			switch (effect.type) {
+				case "register":
+					register();
+					return;
+				case "enable":
+					setActive(true);
+					return;
+				case "disable":
+					setActive(false);
+					return;
+				case "notify":
+					notice(effect.message, effect.level);
+					return;
+				case "invalidate_auth":
+					auth.invalidate();
+					return;
+				case "invalidate_catalog":
+					client.invalidateModel();
+					return;
+				case "abort_check":
+					activeCheck?.abort(
+						new DOMException(
+							"Research availability check superseded",
+							"AbortError",
+						),
+					);
+					activeCheck = undefined;
+					return;
+				case "run_check":
+					return runCheck(effect.token, effect.generation, effect.explicit);
+			}
+		};
+
+		const dispatch = async (event: LifecycleEvent): Promise<void> => {
+			const result = transition(state, event);
+			state = result.state;
+			const started = result.effects.map(perform);
+			await Promise.all(started);
+		};
+
+		const runCheck = (
+			token: number,
+			generation: number,
+			explicit: boolean,
+		): Promise<void> => {
+			const controller = new AbortController();
+			activeCheck = controller;
+			const signal = AbortSignal.any([
+				controller.signal,
+				AbortSignal.timeout(AVAILABILITY_TIMEOUT_MS),
+				runtimeController.signal,
+			]);
+			const isCurrent = () =>
+				!state.shutDown &&
+				state.checkToken === token &&
+				state.generation === generation;
+			const unavailable = (
+				message: string,
+				reasonCode: string,
+				options: { block: boolean; invalidateAuth: boolean },
+			) => {
+				if (isCurrent()) diagnose(`availability:${reasonCode}`);
+				void dispatch({
+					type: "check_unavailable",
+					token,
+					generation,
+					message,
+					...options,
+				});
+			};
+			// Superseded and shutdown checks are discarded by the reducer, so an
+			// aborted signal that reaches a dispatch here means the check timed out.
+			const timedOut = () =>
+				unavailable(AVAILABILITY_MESSAGES.timeout, "timeout", {
+					block: true,
+					invalidateAuth: false,
+				});
+			return (async () => {
+				const result = await auth.check({
+					signal,
+					timeoutMs: AVAILABILITY_TIMEOUT_MS,
+				});
+				if (signal.aborted) return timedOut();
+				if (result.kind !== "ready") {
+					return unavailable(result.message, result.reason, {
+						block: false,
+						invalidateAuth: CREDENTIAL_FAILURES.has(result.reason),
+					});
+				}
+				try {
+					await client.selectModel(result, signal);
+				} catch (cause) {
+					if (signal.aborted) return timedOut();
+					const code =
+						cause instanceof ResearchError
+							? cause.code
+							: "backend_incompatible";
+					return unavailable(AVAILABILITY_MESSAGES[code], code, {
+						block: true,
+						invalidateAuth: code === "auth_required",
+					});
+				}
+				if (signal.aborted) return timedOut();
+				if (isCurrent()) diagnose("availability:ready");
+				void dispatch({ type: "check_ready", token, generation, explicit });
+			})().finally(() => {
+				if (activeCheck === controller) activeCheck = undefined;
+			});
+		};
+
+		const checkAvailability = (
 			ctx: ExtensionContext,
 			explicit: boolean,
 		): Promise<void> => {
 			lastContext = ctx;
-			if (explicit) generation += 1;
-			const checkGeneration = ++availabilityCheckToken;
-			const checkLifecycle = generation;
-			const isCurrent = () =>
-				checkGeneration === availabilityCheckToken &&
-				checkLifecycle === generation;
-			abortAvailabilityCheck(
-				new DOMException(
-					"Research availability check superseded",
-					"AbortError",
-				),
-			);
-			if (blockedUntilRefresh && !explicit) {
-				if (registered) removeResearch(pi);
-				return;
-			}
-			if (explicit) {
-				blockedUntilRefresh = false;
-				lastNotice = undefined;
-				auth.invalidate();
-				client.invalidateModel();
-			}
-			const availabilityController = new AbortController();
-			const timeout = setTimeout(
-				() =>
-					availabilityController.abort(
-						new DOMException(
-							"Research availability check timed out",
-							"TimeoutError",
-						),
-					),
-				5_000,
-			);
-			const onRuntimeAbort = () =>
-				availabilityController.abort(runtimeController.signal.reason);
-			const availabilityCheck = {
-				controller: availabilityController,
-				timeout,
-				onRuntimeAbort,
-			};
-			activeAvailabilityCheck = availabilityCheck;
-			runtimeController.signal.addEventListener("abort", onRuntimeAbort, {
-				once: true,
-			});
-			if (runtimeController.signal.aborted) onRuntimeAbort();
-			try {
-				const result = await auth.check({
-					signal: availabilityController.signal,
-					timeoutMs: 5_000,
-				});
-				if (!isCurrent() || runtimeController.signal.aborted) return;
-				if (availabilityController.signal.aborted) {
-					const message = backendMessage("timeout");
-					availability = { kind: "unavailable", message };
-					deactivate(ctx, message, true);
-					return;
-				}
-				if (result.kind === "ready") {
-					try {
-						await client.selectModel(result, availabilityController.signal);
-					} catch (cause) {
-						if (!isCurrent() || runtimeController.signal.aborted) return;
-						if (availabilityController.signal.aborted) {
-							const message = backendMessage("timeout");
-							availability = { kind: "unavailable", message };
-							deactivate(ctx, message, true);
-							return;
-						}
-						const error =
-							cause instanceof ResearchError
-								? cause
-								: new ResearchError(
-										"backend_incompatible",
-										"Research could not verify Codex backend compatibility.",
-										false,
-									);
-						if (error.code === "auth_required") auth.invalidate();
-						const message = backendMessage(error.code);
-						availability = { kind: "unavailable", message };
-						deactivate(ctx, message, true);
-						return;
-					}
-					if (!isCurrent() || runtimeController.signal.aborted) return;
-					if (availabilityController.signal.aborted) {
-						const message = backendMessage("timeout");
-						availability = { kind: "unavailable", message };
-						deactivate(ctx, message, true);
-						return;
-					}
-					availability = { kind: "ready" };
-					if (!registered) {
-						registerOnce(ctx);
-					} else if (explicit) {
-						registeredGeneration = generation;
-						enableResearch(pi);
-						disabledByExtension = false;
-					} else if (disabledByExtension) {
-						enableResearch(pi);
-						disabledByExtension = false;
-					}
-					if (explicit) notice(ctx, statusText(availability, false), "info");
-					return;
-				}
-				availability = { kind: "unavailable", message: result.message };
-				if (registered) removeResearch(pi);
-				disabledByExtension = true;
-				if (
-					result.reason === "missing_oauth" ||
-					result.reason === "refresh_failed" ||
-					result.reason === "missing_account_id"
-				)
-					auth.invalidate();
-				notice(ctx, result.message, "warning");
-			} finally {
-				cleanupAvailabilityCheck(availabilityCheck);
-			}
+			return dispatch({ type: "check_start", explicit });
 		};
 
 		pi.registerCommand("research", {
@@ -334,7 +255,7 @@ export function createResearchExtension(
 				lastContext = ctx;
 				const command = args.trim().toLowerCase();
 				if (!command || command === "status") {
-					ctx.ui.notify(statusText(availability, blockedUntilRefresh), "info");
+					ctx.ui.notify(statusText(state.availability, state.blocked), "info");
 					return;
 				}
 				if (command === "refresh") {
@@ -346,24 +267,20 @@ export function createResearchExtension(
 		});
 
 		pi.on("session_start", async (_event, ctx) => {
-			generation += 1;
-			if (registered) registeredGeneration = generation;
 			lastContext = ctx;
-			blockedUntilRefresh = false;
+			await dispatch({ type: "session_start" });
 			await checkAvailability(ctx, false);
 		});
 
 		pi.on("before_agent_start", async (_event, ctx) => {
-			lastContext = ctx;
 			await checkAvailability(ctx, false);
 		});
 
 		pi.on("session_shutdown", () => {
-			generation += 1;
-			availabilityCheckToken += 1;
-			const reason = new DOMException("Pi session ended", "AbortError");
-			abortAvailabilityCheck(reason);
-			runtimeController.abort(reason);
+			void dispatch({ type: "shutdown" });
+			runtimeController.abort(
+				new DOMException("Pi session ended", "AbortError"),
+			);
 			auth.dispose();
 		});
 	};

@@ -20,30 +20,22 @@ The slash commands do not perform research or start an LLM turn. The `research` 
 ## Requirements
 
 - Node.js 22.19 or newer.
-- Pi `@earendil-works/pi-coding-agent` 0.85.x, tested with Pi 0.85.1.
+- Pi `@earendil-works/pi-coding-agent` `>=0.85.1 <1.0.0`. CI tests Pi 0.85.1 and 0.87.1.
 - A Pi-managed `openai-codex` OAuth login containing a refreshable access token and ChatGPT account ID.
 - ChatGPT/Codex subscription capacity for each research request.
 
 ## Installation and loading
 
-From this directory:
+From the repository root:
 
 ```sh
 npm install
-pi install .
-```
-
-For project-local installation, use:
-
-```sh
-pi install . --local
-```
-
-Restart or reload Pi after installation. For one-off loading from the repository root, run:
-
-```sh
+pi install ./packages/codex-research-tool
+# One-off loading:
 pi -e ./packages/codex-research-tool
 ```
+
+For project-local installation, add `--local` to `pi install`. Restart or reload Pi after installation.
 
 The package manifest declares `pi.extensions: ["./index.ts"]`.
 
@@ -72,7 +64,7 @@ The complete public tool contract is:
 }
 ```
 
-`query` is trimmed, must not be empty, and is limited to 4,000 characters. It is not silently split or rewritten. `model` is optional and accepts an exact Codex subscription model ID of at most 128 characters. `effort` optionally selects an exact reasoning level supported by that model. Both are checked against the authenticated account's model catalog before research begins. Endpoint, credentials, account ID, and system instructions remain fixed implementation details. There is no `codex_search` alias.
+`query` is trimmed, must not be empty, and is limited to 4,000 characters. It is not silently split or rewritten. `model` is optional and accepts an exact Codex subscription model ID of at most 128 characters. `effort` optionally selects an exact reasoning level supported by that model. Both are checked against the authenticated account's model catalog before research begins; the catalog is cached per account for five minutes. Endpoint, credentials, account ID, and system instructions remain fixed implementation details. There is no `codex_search` alias.
 
 A successful result contains these model-visible sections:
 
@@ -85,7 +77,7 @@ Answer
 Sources
 ```
 
-HTTP(S) URL annotations become deduplicated sources, and safe annotation ranges become claim markers. An answer without citations is returned as `uncited` and explicitly labeled as not source-verified. Empty answers and responses with no observed web-search activity are errors.
+HTTP(S) URL annotations become deduplicated sources, listed as `[n] Title (URL)`, and safe annotation ranges become claim markers. The backend does not document whether annotation offsets count UTF-16 code units or Unicode code points; they only differ after astral characters such as emoji. For such answers, the extension uses whichever reading places the range over the cited link (it contains the URL or its host and its brackets balance), and falls back to UTF-16 when neither does. An answer without citations is returned as `uncited` and explicitly labeled as not source-verified. Empty answers and responses with no observed web-search activity are errors.
 
 ## Configuration and behavior
 
@@ -93,7 +85,9 @@ HTTP(S) URL annotations become deduplicated sources, and safe annotation ranges 
 
 On `session_start`, the extension checks whether Pi stores an OAuth credential for `openai-codex`, asks Pi's model registry to refresh and resolve a usable bearer token, reads the corresponding ChatGPT account ID, and fetches a non-consuming model catalog containing at least one research-capable model. Only then does it register `research`.
 
-If authentication later disappears or the backend rejects access, the extension removes only its own tool and preserves every unrelated active tool. A stale invocation still rechecks credentials before transport. Authentication, access, client-version, and compatibility failures block ordinary automatic reactivation until `/research refresh` is run. An explicit refresh invalidates the cached model selection and repeats both the credential and backend checks. Intentional user deactivation is otherwise preserved.
+If authentication later disappears or the backend rejects access, the extension removes only its own tool and preserves every unrelated active tool. A stale invocation still rechecks credentials before transport. Authentication, access, client-version, and compatibility failures block ordinary automatic reactivation until `/research refresh` is run. An explicit refresh clears the cached credential verification and model catalog and repeats both the credential and backend checks. Intentional user deactivation is otherwise preserved.
+
+Availability is checked again before every agent turn. To keep that cheap, a verified token is reused for up to 30 seconds (and never within a minute of its recorded expiry) while Pi's stored credential is unchanged. The stored credential is still reread on every check, so signing out or switching accounts takes effect on the next turn.
 
 Account identity resolution uses this order:
 
@@ -102,11 +96,11 @@ Account identity resolution uses this order:
 
 Both the refreshed bearer token and account ID are required. Pi's nonempty stored `accountId` is authoritative, so an opaque access token is accepted when that metadata is present; malformed token metadata fails closed when the stored account ID is absent. Missing credentials, API-key credentials, refresh failure, unstable account switching, and timeout also fail closed.
 
-Pi 0.85.1 does not expose cancellation for its internal credential-refresh operation. The extension bounds its own wait and ignores late completion for availability changes, although Pi may finish its serialized refresh in the background. A permanently hung resolver remains tracked so refresh cannot launch overlapping work; reload or restart Pi to recover from that process-level hang.
+Pi does not expose cancellation for its internal credential-refresh operation. The extension bounds its own wait and ignores late completion for availability changes, although Pi may finish its serialized refresh in the background. A permanently hung resolver remains tracked so refresh cannot launch overlapping work; reload or restart Pi to recover from that process-level hang.
 
 ### Research request
 
-Each call sends one self-contained query to the fixed Codex subscription backend. It requests live web search with medium context, requires search-tool activity, sets `store: false`, and streams progress into Pi. The surrounding Pi conversation, repository files, and local instruction files are not forwarded.
+Each call sends one self-contained query to the fixed Codex subscription backend. It requests live web search with medium context, requires search-tool activity, sets `store: false`, and streams progress into Pi. Progress updates show the most recent streamed text and are limited to one every 250 ms, so long answers do not redraw the TUI on every token. The surrounding Pi conversation, repository files, and local instruction files are not forwarded.
 
 Web search is performed inside the Codex response by the backend's `web_search` tool. The extension observes search activity and receives the synthesized answer and URL annotations, but it does not expose a browser session, page bodies, navigation controls, cookies, or caller-selected requests. Consequently, `research` is a one-shot research-answer interface rather than standalone browsing. Use a separate HTTP retrieval tool when a caller needs to choose and inspect a specific URL.
 
@@ -123,7 +117,7 @@ The model-catalog request sends an explicit Codex protocol compatibility version
 
 ### Limits and errors
 
-- Ten-minute total deadline, including OAuth resolution, model discovery, and research.
+- Ten-minute total deadline, including OAuth resolution, model discovery, and research. Timeouts are reported as retryable `timeout` errors; an authentication check that cannot finish within five seconds is reported separately from the research deadline.
 - Pi Escape/cancellation and session shutdown abort active transport.
 - No automatic retries; repeating a query may consume additional subscription capacity.
 - 2 MiB maximum SSE stream and 256 KiB maximum individual SSE frame.
@@ -141,9 +135,13 @@ Pi marks thrown `execute()` failures as tool errors. This extension deliberately
 - Error messages are classified and sanitized before they enter the model context.
 - Sources and answers remain untrusted web content even when citations are present.
 
+## Diagnostics
+
+Set `PI_EXT_DEBUG=codex-research-tool` (or `*`, or a comma-separated list that includes it) to write one reason code per availability decision or failed call to stderr, for example `[codex-research-tool] availability:missing_oauth`. Only fixed reason codes are written, never tokens, account IDs, or queries.
+
 ## Development and verification
 
-The workspace test suite uses synthetic credentials and HTTP/SSE fixtures. Coverage includes OAuth/account precedence and races, API-key rejection, timeouts and cancellation, lifecycle transitions, stale calls, unrelated-tool preservation, the exact tool schema, validated per-call model overrides, non-Codex conversation models, citations, Unicode and chunk boundaries, CRLF and multiline SSE, terminal-envelope fallback, premature EOF, failure events, absent search activity, output limits, redirects, status classification, model catalogs, and secret sanitization.
+The workspace test suite uses synthetic credentials and HTTP/SSE fixtures. The availability lifecycle is a pure state machine (`src/lifecycle.ts`) with table-driven transition tests. Coverage includes OAuth/account precedence and races, credential and catalog caching, API-key rejection, timeouts and cancellation, lifecycle transitions, stale calls, unrelated-tool preservation, the exact tool schema, validated per-call model overrides, non-Codex conversation models, citations, Unicode and chunk boundaries, CRLF and multiline SSE, terminal-envelope fallback, premature EOF, failure events, absent search activity, output limits, redirects, status classification, model catalogs, and secret sanitization.
 
 An offline RPC load check can be run from the repository root:
 

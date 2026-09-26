@@ -1,15 +1,43 @@
 import type { AbortCause } from "./request.ts";
 
-interface ToolErrorDetails {
-	errorType: string;
+export type ErrorType =
+	| "aborted"
+	| "fetch"
+	| "size_limit"
+	| "timeout"
+	| "unknown"
+	| "validation";
+
+export interface ToolErrorDetails {
+	errorType: ErrorType | string;
 	message: string;
 	url?: string | undefined;
 	timeout?: number | undefined;
-	status?: number | undefined;
-	statusText?: string | undefined;
 	maxSize?: number | undefined;
 	actualSize?: number | undefined;
 }
+
+export const toolError = (
+	message: string,
+	details: Omit<ToolErrorDetails, "message">,
+): Error & ToolErrorDetails => Object.assign(new Error(message), details);
+
+/**
+ * URLs are echoed into model context and error logs, so any `user:password@`
+ * userinfo must not survive. Unparseable input falls back to a textual strip
+ * because validation errors echo whatever the caller supplied.
+ */
+export const redactUrl = (url: string): string => {
+	try {
+		const parsed = new URL(url);
+		if (!parsed.username && !parsed.password) return url;
+		parsed.username = "";
+		parsed.password = "";
+		return parsed.toString();
+	} catch {
+		return url.replace(/\/\/[^/?#@]*@/, "//");
+	}
+};
 
 export const normalizeError = (
 	error: unknown,
@@ -17,66 +45,48 @@ export const normalizeError = (
 	timeout?: number,
 	abortCause?: AbortCause,
 ): ToolErrorDetails => {
+	const base = { url: redactUrl(url), timeout };
+
 	if (
 		typeof error === "object" &&
 		error !== null &&
 		"errorType" in error &&
-		typeof (error as { errorType?: unknown }).errorType === "string"
+		typeof error.errorType === "string"
 	) {
-		const typedError = error as {
-			errorType: string;
-			message?: string;
-			maxSize?: number;
-			actualSize?: number;
-		};
-
+		const typed = error as Partial<ToolErrorDetails>;
 		return {
-			errorType: typedError.errorType,
-			message: typedError.message ?? "Unknown error",
-			url,
-			timeout,
-			maxSize: typedError.maxSize,
-			actualSize: typedError.actualSize,
+			...base,
+			errorType: error.errorType,
+			message: typed.message ?? "Unknown error",
+			maxSize: typed.maxSize,
+			actualSize: typed.actualSize,
 		};
 	}
 
-	if (abortCause) {
+	// The abort cause is tracked by the deadline itself, so it is more
+	// reliable than inspecting whatever reason object fetch rethrew.
+	if (abortCause === "timeout") {
 		return {
-			errorType: abortCause === "timeout" ? "timeout" : "aborted",
-			message:
-				abortCause === "timeout" && timeout
-					? `Request timed out after ${timeout}ms`
-					: "Request aborted",
-			url,
-			timeout,
+			...base,
+			errorType: "timeout",
+			message: timeout
+				? `Request timed out after ${timeout}ms`
+				: "Request timed out",
 		};
+	}
+	if (abortCause === "caller") {
+		return { ...base, errorType: "aborted", message: "Request aborted" };
 	}
 
 	if (error instanceof Error) {
-		if (error.name === "AbortError") {
-			return {
-				errorType: abortCause === "timeout" ? "timeout" : "aborted",
-				message:
-					abortCause === "timeout" && timeout
-						? `Request timed out after ${timeout}ms`
-						: "Request aborted",
-				url,
-				timeout,
-			};
-		}
-
-		return {
-			errorType: "fetch",
-			message: error.message,
-			url,
-			timeout,
-		};
+		// undici reports DNS, TLS, and connection failures as a generic
+		// "fetch failed" with the useful detail on `cause`.
+		const cause =
+			error.cause instanceof Error && error.cause.message
+				? `: ${error.cause.message}`
+				: "";
+		return { ...base, errorType: "fetch", message: `${error.message}${cause}` };
 	}
 
-	return {
-		errorType: "unknown",
-		message: String(error),
-		url,
-		timeout,
-	};
+	return { ...base, errorType: "unknown", message: String(error) };
 };

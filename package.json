@@ -11,13 +11,14 @@
 	],
 	"scripts": {
 		"ci": "npm run lint && npm run test && npm run test:coverage && node scripts/verify-packages.mjs",
-		"lint": "biome check --error-on-warnings package.json tsconfig.json packages scripts && tsc --noEmit",
-		"lint:fix": "biome check --write package.json tsconfig.json packages scripts && tsc --noEmit",
+		"lint": "biome check --error-on-warnings package.json tsconfig.json packages scripts test-support && tsc --noEmit",
+		"lint:fix": "biome check --write package.json tsconfig.json packages scripts test-support && tsc --noEmit",
 		"test": "npm run test --workspaces",
 		"test:coverage": "npm run test:coverage --workspaces"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.14",
+		"@earendil-works/pi-ai": "0.85.1",
 		"@earendil-works/pi-coding-agent": "0.85.1",
 		"@earendil-works/pi-tui": "0.85.1",
 		"@types/node": "24.5.2",

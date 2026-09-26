@@ -1,3 +1,12 @@
+import { chatgptAccountIdFromToken } from "pi-extensions-shared/jwt";
+import { SIGN_IN, SIGN_IN_AGAIN } from "./errors.ts";
+import {
+	AUTH_CACHE_TTL_MS,
+	AUTH_EXPIRY_MARGIN_MS,
+	AVAILABILITY_TIMEOUT_MS,
+} from "./limits.ts";
+import { nonemptyString } from "./util.ts";
+
 export const OPENAI_CODEX_PROVIDER = "openai-codex";
 
 export type AuthUnavailableReason =
@@ -5,16 +14,23 @@ export type AuthUnavailableReason =
 	| "refresh_failed"
 	| "missing_account_id"
 	| "check_timeout"
-	| "unsupported_pi";
+	| "check_cancelled";
+
+export interface ReadyAuth {
+	kind: "ready";
+	accessToken: string;
+	accountId: string;
+}
 
 export type AuthResult =
-	| { kind: "ready"; accessToken: string; accountId: string }
+	| ReadyAuth
 	| { kind: "unavailable"; reason: AuthUnavailableReason; message: string };
 
 export interface StoredCredential {
 	type?: unknown;
 	access?: unknown;
 	accountId?: unknown;
+	expires?: unknown;
 }
 
 export interface AuthDependencies {
@@ -23,6 +39,7 @@ export interface AuthDependencies {
 		| undefined
 		| Promise<StoredCredential | undefined>;
 	resolveAccessToken(signal?: AbortSignal): Promise<string | undefined>;
+	now?: () => number;
 }
 
 export interface AuthCheckOptions {
@@ -31,44 +48,19 @@ export interface AuthCheckOptions {
 }
 
 const messages: Record<AuthUnavailableReason, string> = {
-	missing_oauth:
-		"Research unavailable: sign in with /login openai-codex, then run /research refresh.",
-	refresh_failed:
-		"Research needs you to sign in again. Run /login openai-codex, then /research refresh.",
-	missing_account_id:
-		"Research needs you to sign in again. Run /login openai-codex, then /research refresh.",
+	missing_oauth: SIGN_IN,
+	refresh_failed: SIGN_IN_AGAIN,
+	missing_account_id: SIGN_IN_AGAIN,
 	check_timeout:
 		"Research could not check authentication. Run /research refresh to try again.",
-	unsupported_pi:
-		"Research is disabled because this Pi version is unsupported. Install a compatible Pi 0.85.x release.",
+	check_cancelled: "The research authentication check was cancelled.",
 };
 
 function unavailable(reason: AuthUnavailableReason): AuthResult {
 	return { kind: "unavailable", reason, message: messages[reason] };
 }
 
-function nonemptyString(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	return trimmed || undefined;
-}
-
-export function extractAccountIdFromToken(token: string): string | undefined {
-	const parts = token.split(".");
-	if (parts.length !== 3) return undefined;
-	try {
-		const payload = JSON.parse(
-			Buffer.from(parts[1] ?? "", "base64url").toString("utf8"),
-		) as Record<string, unknown>;
-		const authClaim = payload["https://api.openai.com/auth"];
-		if (!authClaim || typeof authClaim !== "object") return undefined;
-		return nonemptyString(
-			(authClaim as Record<string, unknown>).chatgpt_account_id,
-		);
-	} catch {
-		return undefined;
-	}
-}
+export const extractAccountIdFromToken = chatgptAccountIdFromToken;
 
 function credentialAccountId(
 	credential: StoredCredential | undefined,
@@ -80,8 +72,16 @@ function credentialAccountId(
 	);
 }
 
-function abortResult(): AuthResult {
-	return unavailable("check_timeout");
+// Any change to these fields means Pi refreshed, replaced, or removed the
+// login, so a cached result derived from the previous values is no longer
+// trustworthy.
+function credentialKey(credential: StoredCredential | undefined): string {
+	return JSON.stringify([
+		credential?.type,
+		credential?.access,
+		credential?.accountId,
+		credential?.expires,
+	]);
 }
 
 async function withAbort<T>(
@@ -105,86 +105,211 @@ async function withAbort<T>(
 	});
 }
 
+interface Flight {
+	promise: Promise<AuthResult>;
+	settled: boolean;
+	deadline: number;
+	arm(): void;
+}
+
+interface CachedAuth {
+	result: ReadyAuth;
+	key: string;
+	expiresAt: number;
+}
+
 export class AuthAdapter {
-	private inFlight: Promise<AuthResult> | undefined;
+	private flight: Flight | undefined;
+	private cached: CachedAuth | undefined;
+	// Bumped by invalidate() so a flight that started before the invalidation
+	// can still answer its callers but cannot repopulate the cache.
+	private epoch = 0;
 	private readonly pendingRefreshes = new Set<Promise<unknown>>();
 	private disposed = false;
 	private readonly dependencies: AuthDependencies;
+	private readonly now: () => number;
 
 	constructor(dependencies: AuthDependencies) {
 		this.dependencies = dependencies;
+		this.now = dependencies.now ?? Date.now;
 	}
 
 	dispose(): void {
 		this.disposed = true;
+		this.cached = undefined;
 	}
 
 	/**
-	 * Invalidate only an idle result. An active flight may still be before its
-	 * refresh phase, so never abandon it in favor of a duplicate operation.
+	 * Forget the cached result so the next check refreshes the token. An active
+	 * flight is never abandoned: it may already be inside Pi's serialized
+	 * refresh, and starting a second one would race it.
 	 */
 	invalidate(): void {
-		if (this.inFlight) return;
-		this.inFlight = undefined;
+		this.cached = undefined;
+		this.epoch += 1;
 	}
 
 	check(options: AuthCheckOptions = {}): Promise<AuthResult> {
 		if (this.disposed || options.signal?.aborted) {
-			return Promise.resolve(abortResult());
+			return Promise.resolve(unavailable("check_cancelled"));
 		}
-		if (!this.inFlight) {
-			const operation = this.runBounded(options.timeoutMs ?? 5_000);
-			this.inFlight = operation;
-			void operation.then(async () => {
-				while (this.pendingRefreshes.size > 0) {
-					await Promise.allSettled([...this.pendingRefreshes]);
-				}
-				if (this.inFlight === operation) {
-					this.inFlight = undefined;
-				}
-			});
+		const timeoutMs = options.timeoutMs ?? AVAILABILITY_TIMEOUT_MS;
+		const cached = this.cached;
+		if (cached && this.now() < cached.expiresAt) {
+			return this.checkCached(cached, options.signal, timeoutMs);
 		}
-		return this.waitForCaller(this.inFlight, options.signal);
+		return this.checkFresh(options.signal, timeoutMs);
 	}
 
-	private async waitForCaller(
-		promise: Promise<AuthResult>,
-		signal?: AbortSignal,
+	private async checkCached(
+		cached: CachedAuth,
+		signal: AbortSignal | undefined,
+		timeoutMs: number,
 	): Promise<AuthResult> {
-		if (!signal) return promise;
-		if (signal.aborted) return abortResult();
-		return new Promise((resolve) => {
-			const onAbort = () => resolve(abortResult());
-			signal.addEventListener("abort", onAbort, { once: true });
-			void promise.then((result) => {
-				signal.removeEventListener("abort", onAbort);
-				resolve(result);
+		const bound = AbortSignal.any(
+			[signal, AbortSignal.timeout(timeoutMs)].filter(
+				(value): value is AbortSignal => value !== undefined,
+			),
+		);
+		let credential: StoredCredential | undefined;
+		try {
+			credential = await withAbort(
+				Promise.resolve(this.dependencies.readCredential()),
+				bound,
+			);
+		} catch {
+			if (signal?.aborted) return unavailable("check_cancelled");
+			if (bound.aborted) return unavailable("check_timeout");
+			credential = undefined;
+		}
+		if (
+			!this.disposed &&
+			this.cached === cached &&
+			this.now() < cached.expiresAt &&
+			credentialKey(credential) === cached.key
+		) {
+			return cached.result;
+		}
+		if (this.cached === cached) this.cached = undefined;
+		return this.checkFresh(signal, timeoutMs);
+	}
+
+	private checkFresh(
+		signal: AbortSignal | undefined,
+		timeoutMs: number,
+	): Promise<AuthResult> {
+		let flight = this.flight;
+		if (!flight) {
+			flight = this.startFlight(timeoutMs);
+		} else if (!flight.settled) {
+			// A caller willing to wait longer extends the shared flight rather than
+			// inheriting whatever timeout the first caller happened to choose.
+			const deadline = Date.now() + timeoutMs;
+			if (deadline > flight.deadline) {
+				flight.deadline = deadline;
+				flight.arm();
+			}
+		}
+		return this.waitForCaller(flight.promise, signal, timeoutMs);
+	}
+
+	private startFlight(timeoutMs: number): Flight {
+		const controller = new AbortController();
+		const epoch = this.epoch;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const flight: Flight = {
+			promise: Promise.resolve(unavailable("check_timeout")),
+			settled: false,
+			deadline: Date.now() + timeoutMs,
+			arm() {
+				clearTimeout(timer);
+				timer = setTimeout(
+					() => controller.abort(),
+					Math.max(0, flight.deadline - Date.now()),
+				);
+			},
+		};
+		flight.arm();
+		flight.promise = this.resolveConsistent(controller.signal)
+			.then(
+				({ result, credential }) => {
+					if (result.kind === "ready" && epoch === this.epoch)
+						this.remember(result, credential);
+					return result;
+				},
+				() =>
+					controller.signal.aborted
+						? unavailable("check_timeout")
+						: unavailable("refresh_failed"),
+			)
+			.finally(() => {
+				flight.settled = true;
+				clearTimeout(timer);
 			});
+		this.flight = flight;
+		// The flight stays current until every refresh it started has settled,
+		// so a timed-out check can never launch an overlapping refresh.
+		void flight.promise.then(async () => {
+			while (this.pendingRefreshes.size > 0) {
+				await Promise.allSettled([...this.pendingRefreshes]);
+			}
+			if (this.flight === flight) this.flight = undefined;
+		});
+		return flight;
+	}
+
+	private remember(
+		result: ReadyAuth,
+		credential: StoredCredential | undefined,
+	): void {
+		if (this.disposed) return;
+		const now = this.now();
+		let expiresAt = now + AUTH_CACHE_TTL_MS;
+		if (typeof credential?.expires === "number") {
+			expiresAt = Math.min(
+				expiresAt,
+				credential.expires - AUTH_EXPIRY_MARGIN_MS,
+			);
+		}
+		if (expiresAt > now) {
+			this.cached = { result, key: credentialKey(credential), expiresAt };
+		}
+	}
+
+	private waitForCaller(
+		promise: Promise<AuthResult>,
+		signal: AbortSignal | undefined,
+		timeoutMs: number,
+	): Promise<AuthResult> {
+		return new Promise((resolve) => {
+			const timer = setTimeout(
+				() => finish(unavailable("check_timeout")),
+				timeoutMs,
+			);
+			const onAbort = () => finish(unavailable("check_cancelled"));
+			const finish = (result: AuthResult) => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				resolve(result);
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			void promise.then(finish);
 		});
 	}
 
-	private async runBounded(timeoutMs: number): Promise<AuthResult> {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), timeoutMs);
-		try {
-			return await this.resolveConsistent(controller.signal);
-		} catch {
-			return controller.signal.aborted
-				? unavailable("check_timeout")
-				: unavailable("refresh_failed");
-		} finally {
-			clearTimeout(timer);
-		}
-	}
-
-	private async resolveConsistent(signal: AbortSignal): Promise<AuthResult> {
+	private async resolveConsistent(signal: AbortSignal): Promise<{
+		result: AuthResult;
+		credential?: StoredCredential | undefined;
+	}> {
 		for (let attempt = 0; attempt < 2; attempt += 1) {
-			if (this.disposed || signal.aborted) return unavailable("check_timeout");
+			if (this.disposed || signal.aborted)
+				return { result: unavailable("check_timeout") };
 			const before = await withAbort(
 				Promise.resolve(this.dependencies.readCredential()),
 				signal,
 			);
-			if (before?.type !== "oauth") return unavailable("missing_oauth");
+			if (before?.type !== "oauth")
+				return { result: unavailable("missing_oauth") };
 
 			let token: string | undefined;
 			try {
@@ -198,16 +323,20 @@ export class AuthAdapter {
 				);
 				token = nonemptyString(await withAbort(refresh, signal));
 			} catch {
-				if (signal.aborted) return unavailable("check_timeout");
-				return unavailable("refresh_failed");
+				return {
+					result: unavailable(
+						signal.aborted ? "check_timeout" : "refresh_failed",
+					),
+				};
 			}
-			if (!token) return unavailable("refresh_failed");
+			if (!token) return { result: unavailable("refresh_failed") };
 
 			const after = await withAbort(
 				Promise.resolve(this.dependencies.readCredential()),
 				signal,
 			);
-			if (after?.type !== "oauth") return unavailable("missing_oauth");
+			if (after?.type !== "oauth")
+				return { result: unavailable("missing_oauth") };
 			const beforeId = credentialAccountId(
 				before,
 				nonemptyString(before.access),
@@ -215,12 +344,16 @@ export class AuthAdapter {
 			const afterId = credentialAccountId(after, token);
 			if (beforeId && afterId && beforeId !== afterId) {
 				if (attempt === 0) continue;
-				return unavailable("refresh_failed");
+				return { result: unavailable("refresh_failed") };
 			}
-			if (!afterId) return unavailable("missing_account_id");
-			if (this.disposed || signal.aborted) return unavailable("check_timeout");
-			return { kind: "ready", accessToken: token, accountId: afterId };
+			if (!afterId) return { result: unavailable("missing_account_id") };
+			if (this.disposed || signal.aborted)
+				return { result: unavailable("check_timeout") };
+			return {
+				result: { kind: "ready", accessToken: token, accountId: afterId },
+				credential: after,
+			};
 		}
-		return unavailable("refresh_failed");
+		return { result: unavailable("refresh_failed") };
 	}
 }

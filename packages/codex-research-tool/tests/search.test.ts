@@ -1,29 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AuthResult } from "../src/auth.ts";
-import { type CodexClient, ResearchError } from "../src/codex.ts";
+import { holdingEventLoop } from "../../../test-support/async.ts";
+import { partialFake } from "../../../test-support/fakes.ts";
+import type { AuthResult, ReadyAuth } from "../src/auth.ts";
+import { type ResearchBackend, ResearchError } from "../src/codex.ts";
 import {
 	createResearchTool,
 	formatSuccess,
 	MAX_RESULT_CHARS,
+	progressPreview,
 	RESEARCH_DEADLINE_MS,
 	TOOL_DESCRIPTION,
 	TOOL_NAME,
 } from "../src/search.ts";
 
-const auth: Extract<AuthResult, { kind: "ready" }> = {
+const auth: ReadyAuth = {
 	kind: "ready",
 	accessToken: "dummy",
 	accountId: "account",
 };
 
-const context = {
+const context = partialFake<ExtensionContext>({
 	model: { provider: "other", id: "conversation-model" },
-} as unknown as ExtensionContext;
+});
 
-function fakeClient(overrides: Partial<CodexClient> = {}): CodexClient {
+function fakeClient(overrides: Partial<ResearchBackend> = {}): ResearchBackend {
 	return {
+		invalidateModel() {},
 		selectModel: async () => "research-model",
 		runResearch: async () => ({
 			answer: "answer",
@@ -32,7 +36,7 @@ function fakeClient(overrides: Partial<CodexClient> = {}): CodexClient {
 			searchActivity: 1,
 		}),
 		...overrides,
-	} as CodexClient;
+	};
 }
 
 test("exposes only the exact v1 research contract", () => {
@@ -47,7 +51,7 @@ test("exposes only the exact v1 research contract", () => {
 	assert.notEqual(tool.name, "codex_search");
 	assert.equal(tool.label, "Research");
 	assert.equal(tool.description, TOOL_DESCRIPTION);
-	const schema = tool.parameters as unknown as Record<string, unknown>;
+	const schema: Record<string, unknown> = { ...tool.parameters };
 	assert.equal(schema.additionalProperties, false);
 	assert.deepEqual(schema.required, ["query"]);
 	const query = (schema.properties as Record<string, Record<string, unknown>>)
@@ -285,6 +289,7 @@ test("filters unsafe links, deduplicates URLs, and preserves claim markers", () 
 	assert.match(result.details.answer ?? "", /Claim one\. \[1\]/);
 	const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 	assert.equal(text.includes("javascript:"), false);
+	assert.match(text, /^\[1\] One \(https:\/\/example\.com\/one\)$/m);
 });
 
 test("caps both public text and metadata answer", () => {
@@ -536,13 +541,115 @@ test("the total deadline produces a controlled timeout", async () => {
 		}),
 		onUnavailable() {},
 	});
+	await holdingEventLoop(() =>
+		assert.rejects(
+			tool.execute("call", { query: "q" }, undefined, undefined, context),
+			(error: unknown) => {
+				assert.ok(error instanceof ResearchError);
+				assert.equal(error.code, "timeout");
+				assert.equal(error.message, "Research timed out after 5 ms.");
+				assert.equal(error.retryable, true);
+				return true;
+			},
+		),
+	);
+});
+
+test("an auth-check timeout names the auth check, not the research deadline", async () => {
+	const tool = createResearchTool({
+		authCheck: async () => ({
+			kind: "unavailable",
+			reason: "check_timeout",
+			message: "timed out",
+		}),
+		client: fakeClient(),
+		onUnavailable() {},
+	});
 	await assert.rejects(
 		tool.execute("call", { query: "q" }, undefined, undefined, context),
-		(error: unknown) => {
-			assert.ok(error instanceof ResearchError);
-			assert.equal(error.code, "timeout");
-			assert.equal(error.message, "Research timed out after 10 minutes.");
-			return true;
-		},
+		(error: unknown) =>
+			error instanceof ResearchError &&
+			error.code === "timeout" &&
+			/authentication/.test(error.message) &&
+			!/10 minutes/.test(error.message),
 	);
+});
+
+test("a cancelled auth check rejects as cancelled without disabling", async () => {
+	let disabled = false;
+	const tool = createResearchTool({
+		authCheck: async () => ({
+			kind: "unavailable",
+			reason: "check_cancelled",
+			message: "cancelled",
+		}),
+		client: fakeClient(),
+		onUnavailable() {
+			disabled = true;
+		},
+	});
+	await assert.rejects(
+		tool.execute("call", { query: "q" }, undefined, undefined, context),
+		(error: unknown) =>
+			error instanceof ResearchError && error.code === "cancelled",
+	);
+	assert.equal(disabled, false);
+});
+
+test("progress updates are throttled, show the latest text, and stop after the result", async () => {
+	let clock = 0;
+	let progress: ((text: string) => void) | undefined;
+	const updates: string[] = [];
+	const tool = createResearchTool({
+		authCheck: async () => auth,
+		now: () => clock,
+		client: fakeClient({
+			runResearch: async (options) => {
+				progress = options.onProgress;
+				for (const [at, text] of [
+					[0, "first words"],
+					[100, "first words and more"],
+					[249, "first words and more still"],
+					[250, "first words and more still, now later"],
+				] as const) {
+					clock = at;
+					options.onProgress?.(text);
+				}
+				return {
+					answer: "answer",
+					citations: [],
+					model: "m",
+					searchActivity: 1,
+				};
+			},
+		}),
+		onUnavailable() {},
+	});
+	await tool.execute(
+		"call",
+		{ query: "q" },
+		undefined,
+		(update) => {
+			const block = update.content[0];
+			updates.push(block?.type === "text" ? block.text : "");
+		},
+		context,
+	);
+	assert.deepEqual(updates, [
+		"Research: q\n\nSearching…",
+		"Research: q\n\nSearching…\nfirst words",
+		"Research: q\n\nSearching…\nfirst words and more still, now later",
+	]);
+	clock = 10_000;
+	progress?.("late text after the result");
+	assert.equal(updates.length, 3);
+});
+
+test("the progress preview shows the end of long streamed text", () => {
+	const text = `${"start ".repeat(200)}the latest   sentence`;
+	const preview = progressPreview(text);
+	assert.ok(preview.startsWith("…"));
+	assert.ok(preview.endsWith("the latest sentence"));
+	assert.ok(preview.length <= 240);
+	assert.equal(progressPreview("  short\n text "), "short text");
 });

@@ -5,21 +5,38 @@ import {
 	convertToLlm,
 	type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
+import {
+	CODEX_BASE_URL,
+	CODEX_RESPONSES_URL,
+	codexRequestHeaders,
+} from "pi-extensions-shared/codex";
+import { chatgptAccountIdFromToken } from "pi-extensions-shared/jwt";
+import { isRecord } from "pi-extensions-shared/record";
+import { parseSseFrame } from "pi-extensions-shared/sse";
+import { compactionFrames, MAX_FRAME_BYTES } from "./sse.ts";
 
 type AgentMessage =
 	SessionBeforeCompactEvent["preparation"]["messagesToSummarize"][number];
 
-export const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-export const CODEX_RESPONSES_URL = `${CODEX_BASE_URL}/codex/responses`;
+export {
+	CODEX_BASE_URL,
+	CODEX_RESPONSES_URL,
+} from "pi-extensions-shared/codex";
+export { isRecord } from "pi-extensions-shared/record";
+export { MAX_FRAME_BYTES, MAX_STREAM_BYTES } from "./sse.ts";
 export const BETA_FEATURE = "remote_compaction_v2";
 export const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
-export const MAX_STREAM_BYTES = 8 * 1024 * 1024;
-export const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 export const MAX_OPAQUE_ITEM_BYTES = MAX_FRAME_BYTES;
 export const MAX_CHECKPOINT_BYTES = MAX_FRAME_BYTES;
+// Usage is accounting metadata only; a small bound keeps a misbehaving
+// backend from bloating the session file through it.
+export const MAX_USAGE_BYTES = 4 * 1024;
 export const DEFAULT_TIMEOUT_MS = 120_000;
 export const MIN_TIMEOUT_MS = 1_000;
 export const MAX_TIMEOUT_MS = 600_000;
+const MAX_HEADER_COUNT = 64;
+const MAX_HEADER_NAME_LENGTH = 128;
+const MAX_HEADER_VALUE_LENGTH = 8192;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -33,6 +50,11 @@ export interface RemoteCheckpoint {
 	accountFingerprint: string;
 	/** Provider-owned Responses item. It is intentionally not interpreted. */
 	item: JsonObject;
+	/**
+	 * Provider-reported usage of the remote request, when the backend sent it.
+	 * Pi does not account for this request, so this is the only record of it.
+	 */
+	usage?: JsonObject;
 }
 
 export interface RemoteDetails {
@@ -44,28 +66,22 @@ export interface RemoteRequestOptions {
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	headers?: Record<string, string>;
+	/** Receives the completed response's usage object, when one is present. */
+	onUsage?: (usage: JsonObject) => void;
 }
 
-function isRecord(value: unknown): value is JsonObject {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-export function accountIdFromToken(token: string): string | undefined {
-	const part = token.split(".")[1];
-	if (!part) return undefined;
+function serializedBytes(value: unknown): number | undefined {
 	try {
-		const payload = JSON.parse(
-			Buffer.from(part, "base64url").toString("utf8"),
-		) as unknown;
-		if (!isRecord(payload)) return undefined;
-		const auth = payload["https://api.openai.com/auth"];
-		if (!isRecord(auth)) return undefined;
-		const id = auth.chatgpt_account_id;
-		return typeof id === "string" && id.trim() ? id.trim() : undefined;
+		const serialized = JSON.stringify(value);
+		return typeof serialized === "string"
+			? Buffer.byteLength(serialized)
+			: undefined;
 	} catch {
 		return undefined;
 	}
 }
+
+export const accountIdFromToken = chatgptAccountIdFromToken;
 
 export function accountFingerprint(accountId: string): string {
 	return createHash("sha256").update(accountId).digest("base64url");
@@ -92,6 +108,18 @@ export function isTrustedModel(model: Model<Api>): boolean {
 	}
 }
 
+/** Throws unless the value is an integer inside the supported request range. */
+export function validateTimeoutMs(timeoutMs: number): void {
+	if (
+		!Number.isInteger(timeoutMs) ||
+		timeoutMs < MIN_TIMEOUT_MS ||
+		timeoutMs > MAX_TIMEOUT_MS
+	)
+		throw new RangeError(
+			`timeoutMs must be an integer from ${MIN_TIMEOUT_MS} to ${MAX_TIMEOUT_MS}`,
+		);
+}
+
 class PayloadCaptured extends Error {}
 
 /**
@@ -99,6 +127,10 @@ class PayloadCaptured extends Error {}
  * export, this public entry point is stable across the supported 0.85/0.87
  * version boundary and forwards fetch/onPayload options. Capture stops in
  * onPayload before transport, so no request payload reaches the network.
+ *
+ * This relies on streamSimple turning a throw from onPayload into a failed
+ * result rather than a network call; tests/contract.test.ts pins that
+ * behaviour against the installed Pi.
  */
 export async function captureCodexInput(
 	model: Model<Api>,
@@ -139,77 +171,43 @@ export async function captureCodexInput(
 	);
 	await result.result();
 	if (!captured) throw new Error("Codex payload capture failed");
-	const { input, previous_response_id: _previous, ...template } = captured;
+	const { input, ...template } = captured;
 	return { input: input as unknown[], template };
 }
 
-function combineSignals(
-	signal: AbortSignal | undefined,
-	timeoutMs: number,
-): { signal: AbortSignal; cleanup(): void } {
-	const controller = new AbortController();
-	const timeout = setTimeout(
-		() =>
-			controller.abort(
-				new DOMException("Remote compaction timed out", "TimeoutError"),
-			),
-		timeoutMs,
-	);
-	const onAbort = () => controller.abort(signal?.reason);
-	if (signal?.aborted) onAbort();
-	else signal?.addEventListener("abort", onAbort, { once: true });
-	return {
-		signal: controller.signal,
-		cleanup() {
-			clearTimeout(timeout);
-			signal?.removeEventListener("abort", onAbort);
-		},
-	};
+function checkpointKey(item: JsonObject): string {
+	// The encrypted payload is the checkpoint; the id (when present) only
+	// distinguishes otherwise identical items, so key ordering is irrelevant.
+	return JSON.stringify([item.id ?? null, item.encrypted_content]);
 }
 
-function canonicalJson(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	if (isRecord(value))
-		return `{${Object.keys(value)
-			.sort()
-			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
-			.join(",")}}`;
-	return JSON.stringify(value);
+interface CompletedResponse {
+	item: JsonObject;
+	usage?: JsonObject;
 }
 
 async function parseCompleted(
 	body: ReadableStream<Uint8Array>,
 	signal: AbortSignal,
-): Promise<JsonObject> {
-	const reader = body.getReader();
-	const decoder = new TextDecoder();
-	const encoder = new TextEncoder();
+): Promise<CompletedResponse> {
 	const checkpoints = new Map<string, JsonObject>();
-	let buffer = "";
-	let total = 0;
 	const addCheckpoint = (value: unknown): void => {
 		if (!isRecord(value) || value.type !== "compaction") return;
 		if (!validOpaqueItem(value))
 			throw new Error("Remote compaction returned an invalid checkpoint");
-		checkpoints.set(canonicalJson(value), value);
+		const key = checkpointKey(value);
+		if (!checkpoints.has(key)) checkpoints.set(key, value);
 	};
-	const processFrame = (frame: string): boolean => {
-		if (encoder.encode(frame).byteLength > MAX_FRAME_BYTES)
-			throw new Error("Remote compaction SSE frame exceeded its size limit");
-		const raw = frame
-			.split(/\r?\n/)
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trimStart())
-			.join("\n")
-			.trim();
-		if (!raw || raw === "[DONE]") return false;
+	const processFrame = (frame: string): CompletedResponse | undefined => {
+		const parsed = parseSseFrame(frame);
+		if (!parsed) return undefined;
 		let event: unknown;
 		try {
-			event = JSON.parse(raw);
+			event = JSON.parse(parsed.data);
 		} catch {
 			throw new Error("Remote compaction returned malformed SSE");
 		}
-		if (!isRecord(event)) return false;
+		if (!isRecord(event)) return undefined;
 		if (
 			event.type === "error" ||
 			event.type === "response.failed" ||
@@ -218,7 +216,7 @@ async function parseCompleted(
 			throw new Error("Remote compaction failed");
 		if (event.type === "response.output_item.done") addCheckpoint(event.item);
 		if (event.type !== "response.completed" && event.type !== "response.done")
-			return false;
+			return undefined;
 		const response = event.response;
 		if (
 			!isRecord(response) ||
@@ -229,95 +227,72 @@ async function parseCompleted(
 			for (const item of response.output) addCheckpoint(item);
 		if (checkpoints.size !== 1)
 			throw new Error("Remote compaction returned conflicting checkpoints");
-		return true;
+		const item = structuredClone([...checkpoints.values()][0] as JsonObject);
+		const usage = validUsage(response.usage)
+			? structuredClone(response.usage)
+			: undefined;
+		return usage ? { item, usage } : { item };
 	};
-	const onAbort = () => void reader.cancel().catch(() => undefined);
-	signal.addEventListener("abort", onAbort, { once: true });
-	try {
-		while (true) {
-			if (signal.aborted) throw signal.reason;
-			const chunk = await reader.read();
-			if (chunk.value) {
-				total += chunk.value.byteLength;
-				if (total > MAX_STREAM_BYTES)
-					throw new Error("Remote compaction stream exceeded its size limit");
-				buffer += decoder.decode(chunk.value, { stream: !chunk.done });
-			}
-			if (chunk.done) buffer += decoder.decode();
-			let match = /\r?\n\r?\n/.exec(buffer);
-			while (match) {
-				const frame = buffer.slice(0, match.index);
-				buffer = buffer.slice(match.index + match[0].length);
-				if (processFrame(frame)) {
-					if (signal.aborted) throw signal.reason;
-					return structuredClone([...checkpoints.values()][0] as JsonObject);
-				}
-				match = /\r?\n\r?\n/.exec(buffer);
-			}
-			if (encoder.encode(buffer).byteLength > MAX_FRAME_BYTES)
-				throw new Error("Remote compaction SSE frame exceeded its size limit");
-			if (chunk.done) {
-				if (buffer.trim() && processFrame(buffer)) {
-					if (signal.aborted) throw signal.reason;
-					return structuredClone([...checkpoints.values()][0] as JsonObject);
-				}
-				throw new Error(
-					"Remote compaction stream ended without a completed response",
-				);
-			}
+	for await (const frame of compactionFrames(body, signal)) {
+		const completed = processFrame(frame);
+		if (completed) {
+			signal.throwIfAborted();
+			return completed;
 		}
-	} finally {
-		signal.removeEventListener("abort", onAbort);
-		await reader.cancel().catch(() => undefined);
-		reader.releaseLock();
 	}
+	throw new Error(
+		"Remote compaction stream ended without a completed response",
+	);
 }
 
-function mergedHeaders(
+// Preserve documented benign provider metadata, but reject credentials,
+// routing/origin controls, and hop-by-hop/framing headers. This keeps the
+// resolver useful for provider-specific feature headers without allowing it
+// to redirect or smuggle credentials through the fixed Codex request.
+const UNSAFE_HEADER =
+	/^(authorization|proxy-authorization|cookie|set-cookie|origin|host|referer|connection|keep-alive|proxy-connection|transfer-encoding|content-length|upgrade|trailer|forwarded|via|x-forwarded-.+|x-real-ip|.*(?:auth|token|api[-_]?key|credential).*)$/i;
+
+// These are always set by the extension itself, so resolver values for them
+// are discarded even when the unsafe-name pattern would not catch them.
+const FIXED_HEADERS = [
+	"authorization",
+	"chatgpt-account-id",
+	"origin",
+	"host",
+	"content-type",
+	"accept",
+	"openai-beta",
+	"x-codex-beta-features",
+	"originator",
+];
+
+export function mergedHeaders(
 	resolved: Record<string, string> | undefined,
 	auth: { accessToken: string; accountId: string },
 ): Headers {
-	// Preserve documented benign provider metadata, but reject credentials,
-	// routing/origin controls, and hop-by-hop/framing headers. This keeps the
-	// resolver useful for provider-specific feature headers without allowing it
-	// to redirect or smuggle credentials through the fixed Codex request.
-	const unsafe =
-		/^(authorization|proxy-authorization|cookie|set-cookie|origin|host|referer|connection|keep-alive|proxy-connection|transfer-encoding|content-length|upgrade|trailer|forwarded|via|x-forwarded-.+|x-real-ip|.*(?:auth|token|api[-_]?key|credential).*)$/i;
 	const safeResolved = Object.fromEntries(
 		Object.entries(resolved ?? {}).filter(
 			([name, value]) =>
-				name.length <= 128 &&
+				name.length <= MAX_HEADER_NAME_LENGTH &&
 				typeof value === "string" &&
-				value.length <= 8192 &&
-				!unsafe.test(name),
+				value.length <= MAX_HEADER_VALUE_LENGTH &&
+				!UNSAFE_HEADER.test(name),
 		),
 	);
-	if (Object.keys(safeResolved).length > 64)
+	if (Object.keys(safeResolved).length > MAX_HEADER_COUNT)
 		throw new Error("Too many remote compaction headers");
 	const headers = new Headers(safeResolved);
-	for (const name of [
-		"authorization",
-		"chatgpt-account-id",
-		"origin",
-		"host",
-		"content-type",
-		"accept",
-		"openai-beta",
-		"x-codex-beta-features",
-		"originator",
-	])
-		headers.delete(name);
+	for (const name of FIXED_HEADERS) headers.delete(name);
 	for (const [name, value] of Object.entries({
-		Accept: "text/event-stream",
-		Authorization: `Bearer ${auth.accessToken}`,
-		"ChatGPT-Account-ID": auth.accountId,
-		"Content-Type": "application/json",
-		"OpenAI-Beta": "responses=experimental",
+		...codexRequestHeaders(auth),
 		"x-codex-beta-features": BETA_FEATURE,
-		originator: "pi",
 	}))
 		headers.set(name, value);
 	return headers;
+}
+
+function cancelBody(response: Response): void {
+	void response.body?.cancel().catch(() => undefined);
 }
 
 export async function requestRemoteCompaction(
@@ -328,74 +303,68 @@ export async function requestRemoteCompaction(
 ): Promise<JsonObject> {
 	const body: JsonObject = {
 		...template,
-		model: template.model,
 		store: false,
 		stream: true,
 		input: [...input, { type: "compaction_trigger" }],
 	};
+	// Remote compaction must see the full supplied prefix, never a server-side
+	// continuation that could reintroduce history the caller chose to discard.
 	delete body.previous_response_id;
 	const encoded = JSON.stringify(body);
 	if (Buffer.byteLength(encoded) > MAX_REQUEST_BYTES)
 		throw new Error("Remote compaction request exceeded its size limit");
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-	if (
-		!Number.isFinite(timeoutMs) ||
-		!Number.isInteger(timeoutMs) ||
-		timeoutMs < MIN_TIMEOUT_MS ||
-		timeoutMs > MAX_TIMEOUT_MS
-	)
-		throw new RangeError(
-			`timeoutMs must be an integer from ${MIN_TIMEOUT_MS} to ${MAX_TIMEOUT_MS}`,
-		);
-	const combined = combineSignals(options.signal, timeoutMs);
+	validateTimeoutMs(timeoutMs);
+	const signal = AbortSignal.any([
+		...(options.signal ? [options.signal] : []),
+		AbortSignal.timeout(timeoutMs),
+	]);
+	signal.throwIfAborted();
+	const pendingResponse = Promise.resolve().then(() =>
+		(options.fetch ?? globalThis.fetch)(CODEX_RESPONSES_URL, {
+			method: "POST",
+			redirect: "manual",
+			signal,
+			headers: mergedHeaders(options.headers, auth),
+			body: encoded,
+		}),
+	);
+	// A fetch implementation may ignore the signal and resolve after we have
+	// given up; its body must still be released.
+	void pendingResponse.then(
+		(lateResponse) => {
+			if (signal.aborted) cancelBody(lateResponse);
+		},
+		() => undefined,
+	);
+	let onAbort: (() => void) | undefined;
+	const aborted = new Promise<never>((_resolve, reject) => {
+		onAbort = () => reject(signal.reason);
+		if (signal.aborted) onAbort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+	});
+	let response: Response;
 	try {
-		if (combined.signal.aborted) throw combined.signal.reason;
-		const pendingResponse = Promise.resolve().then(() =>
-			(options.fetch ?? globalThis.fetch)(CODEX_RESPONSES_URL, {
-				method: "POST",
-				redirect: "manual",
-				signal: combined.signal,
-				headers: mergedHeaders(options.headers, auth),
-				body: encoded,
-			}),
-		);
-		void pendingResponse.then(
-			(lateResponse) => {
-				if (combined.signal.aborted)
-					void lateResponse.body?.cancel().catch(() => undefined);
-			},
-			() => undefined,
-		);
-		let onAbort: (() => void) | undefined;
-		const aborted = new Promise<never>((_resolve, reject) => {
-			onAbort = () => reject(combined.signal.reason);
-			if (combined.signal.aborted) onAbort();
-			else combined.signal.addEventListener("abort", onAbort, { once: true });
-		});
-		let response: Response;
-		try {
-			response = await Promise.race([pendingResponse, aborted]);
-		} finally {
-			if (onAbort) combined.signal.removeEventListener("abort", onAbort);
-		}
-		if (combined.signal.aborted) {
-			void response.body?.cancel().catch(() => undefined);
-			throw combined.signal.reason;
-		}
-		if (response.status >= 300 && response.status < 400) {
-			void response.body?.cancel().catch(() => undefined);
-			throw new Error("Remote compaction refused an unexpected redirect");
-		}
-		if (!response.ok || !response.body) {
-			void response.body?.cancel().catch(() => undefined);
-			throw new Error(`Remote compaction failed (HTTP ${response.status})`);
-		}
-		const checkpoint = await parseCompleted(response.body, combined.signal);
-		if (combined.signal.aborted) throw combined.signal.reason;
-		return checkpoint;
+		response = await Promise.race([pendingResponse, aborted]);
 	} finally {
-		combined.cleanup();
+		if (onAbort) signal.removeEventListener("abort", onAbort);
 	}
+	if (signal.aborted) {
+		cancelBody(response);
+		throw signal.reason;
+	}
+	if (response.status >= 300 && response.status < 400) {
+		cancelBody(response);
+		throw new Error("Remote compaction refused an unexpected redirect");
+	}
+	if (!response.ok || !response.body) {
+		cancelBody(response);
+		throw new Error(`Remote compaction failed (HTTP ${response.status})`);
+	}
+	const completed = await parseCompleted(response.body, signal);
+	signal.throwIfAborted();
+	if (completed.usage) options.onUsage?.(completed.usage);
+	return completed.item;
 }
 
 function validOpaqueItem(value: unknown): value is JsonObject {
@@ -403,28 +372,43 @@ function validOpaqueItem(value: unknown): value is JsonObject {
 		!isRecord(value) ||
 		value.type !== "compaction" ||
 		typeof value.encrypted_content !== "string" ||
-		value.encrypted_content.length === 0 ||
-		Buffer.byteLength(value.encrypted_content) > MAX_STREAM_BYTES
+		value.encrypted_content.length === 0
 	)
 		return false;
-	try {
-		return Buffer.byteLength(JSON.stringify(value)) <= MAX_OPAQUE_ITEM_BYTES;
-	} catch {
-		return false;
-	}
+	const bytes = serializedBytes(value);
+	return bytes !== undefined && bytes <= MAX_OPAQUE_ITEM_BYTES;
+}
+
+function validUsage(value: unknown): value is JsonObject {
+	if (!isRecord(value)) return false;
+	const bytes = serializedBytes(value);
+	return bytes !== undefined && bytes <= MAX_USAGE_BYTES;
+}
+
+export function buildCheckpoint(
+	model: string,
+	fingerprint: string,
+	item: JsonObject,
+	usage?: JsonObject,
+): RemoteCheckpoint {
+	return {
+		version: 1,
+		provider: "openai-codex",
+		api: "openai-codex-responses",
+		model,
+		endpoint: CODEX_RESPONSES_URL,
+		authMode: "oauth",
+		accountFingerprint: fingerprint,
+		item,
+		...(usage ? { usage } : {}),
+	};
 }
 
 export function parseCheckpoint(value: unknown): RemoteCheckpoint | undefined {
-	let serializedBytes: number;
-	try {
-		const serialized = JSON.stringify(value);
-		if (typeof serialized !== "string") return undefined;
-		serializedBytes = Buffer.byteLength(serialized);
-	} catch {
-		return undefined;
-	}
+	const bytes = serializedBytes(value);
 	if (
-		serializedBytes > MAX_CHECKPOINT_BYTES ||
+		bytes === undefined ||
+		bytes > MAX_CHECKPOINT_BYTES ||
 		!isRecord(value) ||
 		value.version !== 1 ||
 		value.provider !== "openai-codex" ||
@@ -437,8 +421,18 @@ export function parseCheckpoint(value: unknown): RemoteCheckpoint | undefined {
 		!value.accountFingerprint ||
 		value.model.length > 256 ||
 		value.accountFingerprint.length > 256 ||
-		!validOpaqueItem(value.item)
+		!validOpaqueItem(value.item) ||
+		// Usage is optional so checkpoints written before it was recorded stay
+		// valid, but a present non-object value means the entry is corrupt.
+		(value.usage !== undefined && !isRecord(value.usage))
 	)
 		return undefined;
-	return value as unknown as RemoteCheckpoint;
+	// Rebuilt rather than returned as-is, so unknown fields in a stored entry
+	// never travel further than this validation.
+	return buildCheckpoint(
+		value.model,
+		value.accountFingerprint,
+		value.item,
+		value.usage,
+	);
 }

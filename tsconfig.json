@@ -6,11 +6,19 @@
 		"strict": true,
 		"noUncheckedIndexedAccess": true,
 		"exactOptionalPropertyTypes": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noImplicitOverride": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"erasableSyntaxOnly": true,
+		"verbatimModuleSyntax": true,
 		"skipLibCheck": true,
 		"allowImportingTsExtensions": true,
+		"resolveJsonModule": true,
 		"noEmit": true,
 		"types": ["node"]
 	},
-	"include": ["packages/**/*.ts"],
+	"include": ["packages/**/*.ts", "test-support/**/*.ts"],
 	"exclude": ["**/node_modules/**"]
 }

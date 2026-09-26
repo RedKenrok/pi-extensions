@@ -4,20 +4,34 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import type { AuthResult } from "./auth.ts";
+import type { CodexResearchResult, ResearchBackend } from "./codex.ts";
 import {
-	type CodexClient,
+	disablesTool,
 	type ModelOption,
 	ResearchError,
 	type ResearchErrorCode,
-} from "./codex.ts";
+	researchError,
+} from "./errors.ts";
+import {
+	MAX_EFFORT_CHARS,
+	MAX_MODEL_ID_CHARS,
+	MAX_QUERY_CHARS,
+	MAX_RESULT_CHARS,
+	MAX_SOURCE_TITLE_CHARS,
+	MAX_SOURCES_CHARS,
+	PROGRESS_INTERVAL_MS,
+	PROGRESS_PREVIEW_CHARS,
+	RESEARCH_DEADLINE_MS,
+} from "./limits.ts";
+import { diagnose, formatDuration, isTimeoutReason } from "./util.ts";
+
+export { MAX_RESULT_CHARS, RESEARCH_DEADLINE_MS } from "./limits.ts";
 
 export const TOOL_NAME = "research";
 export const TOOL_DESCRIPTION =
 	"Research the web and answer concisely with source links. Use for current facts, documentation, or evidence. Put all context in the query; verify key claims from cited sources.";
-export const MAX_RESULT_CHARS = 20_000;
-export const RESEARCH_DEADLINE_MS = 10 * 60_000;
 
 export interface ResearchSource {
 	title: string;
@@ -45,7 +59,7 @@ export interface ResearchDetails {
 
 export interface ResearchToolDependencies {
 	authCheck(signal?: AbortSignal): Promise<AuthResult>;
-	client: CodexClient;
+	client: ResearchBackend;
 	onUnavailable(
 		reason: "credentials" | "backend",
 		code?: ResearchErrorCode,
@@ -59,21 +73,21 @@ const parameters = Type.Object(
 	{
 		query: Type.String({
 			minLength: 1,
-			maxLength: 4000,
+			maxLength: MAX_QUERY_CHARS,
 			description:
 				"Self-contained question; include relevant versions, dates, or preferred sources.",
 		}),
 		model: Type.Optional(
 			Type.String({
 				minLength: 1,
-				maxLength: 128,
+				maxLength: MAX_MODEL_ID_CHARS,
 				description: "Exact subscription model ID; omit to prefer Luna.",
 			}),
 		),
 		effort: Type.Optional(
 			Type.String({
 				minLength: 1,
-				maxLength: 32,
+				maxLength: MAX_EFFORT_CHARS,
 				description:
 					"Supported reasoning effort (e.g. low, medium, high, xhigh).",
 			}),
@@ -81,6 +95,8 @@ const parameters = Type.Object(
 	},
 	{ additionalProperties: false },
 );
+
+export type ResearchParams = Static<typeof parameters>;
 
 function isHttpUrl(url: string): boolean {
 	try {
@@ -134,7 +150,7 @@ function applyCitationMarkers(
 
 export function formatSuccess(
 	query: string,
-	result: Awaited<ReturnType<CodexClient["runResearch"]>>,
+	result: CodexResearchResult,
 	elapsedMs: number,
 ): AgentToolResult<ResearchDetails> {
 	const sources: ResearchSource[] = [];
@@ -151,15 +167,13 @@ export function formatSuccess(
 	const sourceLines: string[] = [];
 	const renderedSources: ResearchSource[] = [];
 	let sourceChars = 0;
-	for (let index = 0; index < sources.length; index += 1) {
-		const source = sources[index];
-		if (!source) continue;
+	for (const [index, source] of sources.entries()) {
 		const title =
-			source.title.length > 300
-				? `${source.title.slice(0, 297)}...`
+			source.title.length > MAX_SOURCE_TITLE_CHARS
+				? `${source.title.slice(0, MAX_SOURCE_TITLE_CHARS - 3)}...`
 				: source.title;
-		const line = `[${index + 1}] ${title} — ${source.url}`;
-		if (sourceChars + line.length + 1 > 6_000) {
+		const line = `[${index + 1}] ${title} (${source.url})`;
+		if (sourceChars + line.length + 1 > MAX_SOURCES_CHARS) {
 			truncated = true;
 			break;
 		}
@@ -180,8 +194,7 @@ export function formatSuccess(
 	const execution = `Model: ${result.model}${result.effort ? `\nReasoning effort: ${result.effort}` : ""}`;
 	const prefix = `Status: ${status}\nQuery: ${query}\n${execution}\n\nAnswer:\n`;
 	const sourcesBlock = `\n\nSources:\n${sourceLines.length > 0 ? sourceLines.join("\n") : "(none)"}`;
-	const truncationNotice =
-		"\n\n[Result truncated to the 20,000 character limit.]";
+	const truncationNotice = `\n\n[Result truncated to the ${MAX_RESULT_CHARS.toLocaleString("en-US")} character limit.]`;
 	const untruncatedBudget =
 		MAX_RESULT_CHARS - prefix.length - warning.length - sourcesBlock.length;
 	if (answer.length > untruncatedBudget) {
@@ -190,11 +203,7 @@ export function formatSuccess(
 	if (truncated) {
 		const answerBudget = Math.max(
 			0,
-			MAX_RESULT_CHARS -
-				prefix.length -
-				warning.length -
-				sourcesBlock.length -
-				truncationNotice.length,
+			untruncatedBudget - truncationNotice.length,
 		);
 		if (answer.length > answerBudget) {
 			answer =
@@ -220,59 +229,88 @@ export function formatSuccess(
 	};
 }
 
-function unavailableError(
-	auth: Exclude<AuthResult, { kind: "ready" }>,
+/**
+ * Turns an aborted deadline signal into the error the caller sees. The message
+ * names the configured deadline, because a fixed duration would be wrong for
+ * any non-default deadline.
+ */
+function deadlineFailure(
+	signal: AbortSignal,
+	deadlineMs: number,
 ): ResearchError {
-	return new ResearchError("auth_required", auth.message, false);
+	return isTimeoutReason(signal.reason)
+		? researchError(
+				"timeout",
+				`Research timed out after ${formatDuration(deadlineMs)}.`,
+			)
+		: researchError("cancelled");
 }
 
-function deadlineSignal(
-	timeoutMs: number,
-	...parents: Array<AbortSignal | undefined>
-): {
-	signal: AbortSignal;
-	cleanup(): void;
+function validateParams(params: ResearchParams): {
+	query: string;
+	model: string | undefined;
+	effort: string | undefined;
 } {
-	const controller = new AbortController();
-	const timer = setTimeout(
-		() =>
-			controller.abort(
-				new DOMException("Research deadline exceeded", "TimeoutError"),
-			),
-		timeoutMs,
-	);
-	const listeners = parents
-		.filter((parent): parent is AbortSignal => Boolean(parent))
-		.map((parent) => {
-			const onAbort = () => controller.abort(parent.reason);
-			parent.addEventListener("abort", onAbort, { once: true });
-			if (parent.aborted) onAbort();
-			return { parent, onAbort };
-		});
-	return {
-		signal: controller.signal,
-		cleanup() {
-			clearTimeout(timer);
-			for (const { parent, onAbort } of listeners) {
-				parent.removeEventListener("abort", onAbort);
-			}
-		},
-	};
+	const query = typeof params.query === "string" ? params.query.trim() : "";
+	const model =
+		typeof params.model === "string" ? params.model.trim() : undefined;
+	const effort =
+		typeof params.effort === "string" ? params.effort.trim() : undefined;
+	if (!query || query.length > MAX_QUERY_CHARS) {
+		throw researchError(
+			"invalid_input",
+			query
+				? `The research query exceeds ${MAX_QUERY_CHARS.toLocaleString("en-US")} characters.`
+				: "The research query is empty.",
+		);
+	}
+	if (
+		params.model !== undefined &&
+		(!model || model.length > MAX_MODEL_ID_CHARS)
+	) {
+		throw researchError(
+			"invalid_input",
+			`The research model must be a non-empty model ID of at most ${MAX_MODEL_ID_CHARS} characters.`,
+		);
+	}
+	if (
+		params.effort !== undefined &&
+		(!effort || effort.length > MAX_EFFORT_CHARS)
+	) {
+		throw researchError(
+			"invalid_input",
+			`The research effort must be a non-empty reasoning level of at most ${MAX_EFFORT_CHARS} characters.`,
+		);
+	}
+	return { query, model, effort };
 }
 
-function backendDisables(code: ResearchErrorCode): boolean {
-	return [
-		"auth_required",
-		"access_denied",
-		"client_outdated",
-		"backend_incompatible",
-	].includes(code);
+function progressText(query: string, preview: string): string {
+	return `Research: ${query}\n\nSearching…${preview ? `\n${preview}` : ""}`;
+}
+
+/**
+ * Builds the progress preview from the end of the streamed text, so the user
+ * sees the answer advancing instead of a frozen opening sentence. Only a
+ * bounded tail is normalized, which keeps each update constant-time however
+ * long the answer grows.
+ */
+export function progressPreview(text: string): string {
+	const tail = text.slice(-PROGRESS_PREVIEW_CHARS * 4);
+	const normalized = tail.replace(/\s+/g, " ").trim();
+	if (
+		normalized.length <= PROGRESS_PREVIEW_CHARS &&
+		tail.length === text.length
+	)
+		return normalized;
+	return `…${normalized.slice(-(PROGRESS_PREVIEW_CHARS - 1)).trimStart()}`;
 }
 
 export function createResearchTool(
 	dependencies: ResearchToolDependencies,
 ): ToolDefinition<typeof parameters, ResearchDetails> {
 	const now = dependencies.now ?? Date.now;
+	const deadlineMs = dependencies.deadlineMs ?? RESEARCH_DEADLINE_MS;
 	return {
 		name: TOOL_NAME,
 		label: "Research",
@@ -287,61 +325,24 @@ export function createResearchTool(
 			_ctx: ExtensionContext,
 		) {
 			const started = now();
-			const query = typeof params.query === "string" ? params.query.trim() : "";
-			const requestedModel =
-				typeof params.model === "string" ? params.model.trim() : undefined;
-			const requestedEffort =
-				typeof params.effort === "string" ? params.effort.trim() : undefined;
-			if (!query || query.length > 4000) {
-				throw new ResearchError(
-					"invalid_input",
-					query
-						? "The research query exceeds 4,000 characters."
-						: "The research query is empty.",
-					false,
-				);
-			}
-			if (
-				params.model !== undefined &&
-				(!requestedModel || requestedModel.length > 128)
-			) {
-				throw new ResearchError(
-					"invalid_input",
-					"The research model must be a non-empty model ID of at most 128 characters.",
-					false,
-				);
-			}
-			if (
-				params.effort !== undefined &&
-				(!requestedEffort || requestedEffort.length > 32)
-			) {
-				throw new ResearchError(
-					"invalid_input",
-					"The research effort must be a non-empty reasoning level of at most 32 characters.",
-					false,
-				);
-			}
-			const deadline = deadlineSignal(
-				dependencies.deadlineMs ?? RESEARCH_DEADLINE_MS,
-				signal,
-				dependencies.runtimeSignal,
+			const {
+				query,
+				model: requestedModel,
+				effort: requestedEffort,
+			} = validateParams(params);
+			const deadline = AbortSignal.any(
+				[
+					AbortSignal.timeout(deadlineMs),
+					signal,
+					dependencies.runtimeSignal,
+				].filter((value): value is AbortSignal => value !== undefined),
 			);
-			try {
-				if (deadline.signal.aborted) {
-					throw new ResearchError(
-						deadline.signal.reason instanceof Error &&
-							deadline.signal.reason.name === "TimeoutError"
-							? "timeout"
-							: "cancelled",
-						deadline.signal.reason instanceof Error &&
-							deadline.signal.reason.name === "TimeoutError"
-							? "Research timed out after 10 minutes."
-							: "Research was cancelled.",
-						false,
-					);
-				}
+			let settled = false;
+			let lastProgressAt: number | undefined;
+			const update = (preview: string) => {
+				if (settled) return;
 				onUpdate?.({
-					content: [{ type: "text", text: `Research: ${query}\n\nSearching…` }],
+					content: [{ type: "text", text: progressText(query, preview) }],
 					details: {
 						status: "ok",
 						query,
@@ -350,44 +351,28 @@ export function createResearchTool(
 						truncated: false,
 					},
 				});
-				const auth = await dependencies.authCheck(deadline.signal);
+			};
+			try {
+				if (deadline.aborted) throw deadlineFailure(deadline, deadlineMs);
+				update("");
+				const auth = await dependencies.authCheck(deadline);
+				if (deadline.aborted) throw deadlineFailure(deadline, deadlineMs);
 				if (auth.kind !== "ready") {
-					if (deadline.signal.aborted) {
-						throw new ResearchError(
-							deadline.signal.reason instanceof Error &&
-								deadline.signal.reason.name === "TimeoutError"
-								? "timeout"
-								: "cancelled",
-							deadline.signal.reason instanceof Error &&
-								deadline.signal.reason.name === "TimeoutError"
-								? "Research timed out after 10 minutes."
-								: "Research was cancelled.",
-							false,
+					if (auth.reason === "check_timeout") {
+						throw researchError(
+							"timeout",
+							"Research could not check authentication in time.",
 						);
 					}
-					if (auth.reason === "check_timeout") {
-						throw new ResearchError(
-							"timeout",
-							"Research timed out after 10 minutes.",
-							false,
-						);
+					if (auth.reason === "check_cancelled") {
+						throw researchError("cancelled");
 					}
 					dependencies.onUnavailable("credentials", "auth_required");
-					throw unavailableError(auth);
-				}
-				if (deadline.signal.aborted) {
-					throw deadline.signal.reason instanceof Error &&
-						deadline.signal.reason.name === "TimeoutError"
-						? new ResearchError(
-								"timeout",
-								"Research timed out after 10 minutes.",
-								false,
-							)
-						: new ResearchError("cancelled", "Research was cancelled.", false);
+					throw researchError("auth_required", auth.message);
 				}
 				const model = await dependencies.client.selectModel(
 					auth,
-					deadline.signal,
+					deadline,
 					requestedModel,
 					requestedEffort,
 				);
@@ -396,52 +381,31 @@ export function createResearchTool(
 					auth,
 					model,
 					...(requestedEffort ? { effort: requestedEffort } : {}),
-					signal: deadline.signal,
+					signal: deadline,
 					onProgress(text) {
-						const preview = text.replace(/\s+/g, " ").trim().slice(0, 240);
-						onUpdate?.({
-							content: [
-								{
-									type: "text",
-									text: `Research: ${query}\n\nSearching…${preview ? `\n${preview}` : ""}`,
-								},
-							],
-							details: {
-								status: "ok",
-								query,
-								sources: [],
-								elapsedMs: now() - started,
-								truncated: false,
-							},
-						});
+						const at = now();
+						if (
+							lastProgressAt !== undefined &&
+							at - lastProgressAt < PROGRESS_INTERVAL_MS
+						)
+							return;
+						lastProgressAt = at;
+						update(progressPreview(text));
 					},
 				});
 				return formatSuccess(query, result, now() - started);
 			} catch (cause) {
-				const error = deadline.signal.aborted
-					? new ResearchError(
-							deadline.signal.reason instanceof Error &&
-								deadline.signal.reason.name === "TimeoutError"
-								? "timeout"
-								: "cancelled",
-							deadline.signal.reason instanceof Error &&
-								deadline.signal.reason.name === "TimeoutError"
-								? "Research timed out after 10 minutes."
-								: "Research was cancelled.",
-							false,
-						)
+				const error = deadline.aborted
+					? deadlineFailure(deadline, deadlineMs)
 					: cause instanceof ResearchError
 						? cause
-						: new ResearchError(
-								"network",
-								"Codex research could not reach the backend.",
-								true,
-							);
-				const disabled = backendDisables(error.code);
-				if (disabled) dependencies.onUnavailable("backend", error.code);
+						: researchError("network");
+				diagnose(`research:error:${error.code}`);
+				if (disablesTool(error.code))
+					dependencies.onUnavailable("backend", error.code);
 				throw error;
 			} finally {
-				deadline.cleanup();
+				settled = true;
 			}
 		},
 		renderCall(args, theme) {

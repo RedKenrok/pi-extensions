@@ -1,25 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { jwt } from "../../../test-support/jwt.ts";
 import { createCodexCompactionExtension } from "../index.ts";
 import { accountFingerprint, CODEX_RESPONSES_URL } from "../src/remote.ts";
+import { CODEX_BASE, fakeContext, fakePi, model } from "./fakes.ts";
 
 const PREFIX =
 	"The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
-const jwt = (account: string) =>
-	`x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: account } })).toString("base64url")}.y`;
-const model = {
-	provider: "openai-codex",
-	api: "openai-codex-responses",
-	id: "gpt-5.4",
-	baseUrl: "https://chatgpt.com/backend-api",
-	reasoning: true,
-	input: ["text"],
-	name: "Codex",
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 100_000,
-	maxTokens: 10_000,
-};
 const checkpoint = {
 	version: 1,
 	provider: "openai-codex",
@@ -31,34 +19,15 @@ const checkpoint = {
 	item: { type: "compaction", encrypted_content: "secret" },
 };
 
-interface ReplayContext {
-	model: typeof model;
-	modelRegistry: {
-		isUsingOAuth(): boolean;
-		getApiKeyAndHeaders(): Promise<{
-			ok: true;
-			apiKey: string;
-			baseUrl: string;
-		}>;
-	};
-	sessionManager: { getBranch(): unknown[] };
-}
-
 function setup(
 	details: unknown,
 	tail: unknown[] = [],
 	firstKeptEntryId = "compaction-1",
 	before: unknown[] = [],
 ) {
-	let replay:
-		| ((event: { payload: unknown }, ctx: ReplayContext) => Promise<unknown>)
-		| undefined;
-	const pi = {
-		on(name: string, handler: unknown) {
-			if (name === "before_provider_request") replay = handler as typeof replay;
-		},
-	} as unknown as ExtensionAPI;
-	createCodexCompactionExtension()(pi);
+	const pi = fakePi();
+	createCodexCompactionExtension()(pi.api);
+	const handler = pi.replayHandler();
 	const compaction = {
 		type: "compaction",
 		id: "compaction-1",
@@ -67,20 +36,17 @@ function setup(
 		details,
 	};
 	const branch = [...before, compaction, ...tail];
-	const ctx = {
-		model,
-		modelRegistry: {
-			isUsingOAuth: () => true,
-			getApiKeyAndHeaders: async () => ({
-				ok: true as const,
-				apiKey: jwt("acct"),
-				baseUrl: "https://chatgpt.com/backend-api",
-			}),
+	let authCalls = 0;
+	const ctx = fakeContext({
+		getApiKeyAndHeaders: async () => {
+			authCalls += 1;
+			return { ok: true, apiKey: jwt("acct"), baseUrl: CODEX_BASE };
 		},
-		sessionManager: { getBranch: () => branch },
-	};
-	assert.ok(replay);
-	return { replay, ctx };
+		getBranch: () => branch,
+	});
+	const replay = (event: { payload: unknown }, context: ExtensionContext) =>
+		handler({ type: "before_provider_request", ...event }, context);
+	return { replay, ctx, branch, getAuthCalls: () => authCalls };
 }
 
 test("replaces only the generated summary and preserves the converted tail byte-for-byte", async () => {
@@ -287,4 +253,37 @@ test("account mismatch and ambiguous summary matches leave payload untouched", a
 		),
 		undefined,
 	);
+});
+
+test("replay decisions follow branch changes and skip work for other models", async () => {
+	const summary = {
+		role: "user",
+		content: [{ type: "input_text", text: `${PREFIX}readable\n</summary>` }],
+	};
+	const state = setup({ remoteCompaction: checkpoint }, [
+		{ type: "message", id: "leaf-1", message: { role: "user" } },
+	]);
+	const payload = { model: model.id, input: [summary] };
+	assert.ok(await state.replay({ payload }, state.ctx));
+	assert.ok(await state.replay({ payload }, state.ctx));
+	state.branch.push({
+		type: "message",
+		id: "leaf-2",
+		message: {
+			role: "assistant",
+			provider: "openai-codex",
+			api: "openai-codex-responses",
+			model: "other",
+		},
+	});
+	assert.equal(await state.replay({ payload }, state.ctx), undefined);
+	const calls = state.getAuthCalls();
+	assert.equal(
+		await state.replay(
+			{ payload: { model: "other-model", input: [summary] } },
+			state.ctx,
+		),
+		undefined,
+	);
+	assert.equal(state.getAuthCalls(), calls);
 });

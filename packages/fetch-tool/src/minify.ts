@@ -1,3 +1,5 @@
+import { classifyContentType } from "./content-type.ts";
+
 export interface MinifyResult {
 	content: string;
 	minified: boolean;
@@ -48,28 +50,6 @@ const HTML_VOID_ELEMENTS = new Set([
 ]);
 
 const HTML_RAW_TEXT_ELEMENTS = new Set(["script", "style", "textarea"]);
-
-const isJsonContentType = (contentType: string): boolean => {
-	return /(?:^|[;/\s])(?:application|text)\/(?:[\w.-]+\+)?json(?:[;\s]|$)/i.test(
-		contentType,
-	);
-};
-
-const isXmlContentType = (contentType: string): boolean => {
-	return /(?:^|[;/\s])(?:application|text)\/(?:[\w.-]+\+)?xml(?:[;\s]|$)/i.test(
-		contentType,
-	);
-};
-
-const isNdjsonContentType = (contentType: string): boolean => {
-	return /(?:^|[;/\s])(?:application|text)\/(?:x-)?(?:ndjson|jsonl|jsonlines)(?:[;\s]|$)/i.test(
-		contentType,
-	);
-};
-
-const isHtmlContentType = (contentType: string): boolean => {
-	return /(?:^|[;/\s])text\/html(?:[;\s]|$)/i.test(contentType);
-};
 
 const findMarkupEnd = (value: string, start: number): number => {
 	if (value.startsWith("<!--", start)) {
@@ -336,38 +316,25 @@ export const minifyText = (
 	contentType: string,
 ): MinifyResult => {
 	const trimmed = content.trim();
+	const kind = classifyContentType(contentType);
+	const result = (minified: string | undefined): MinifyResult | undefined =>
+		minified === undefined
+			? undefined
+			: { content: minified, minified: minified.length < content.length };
 
-	if (isNdjsonContentType(contentType)) {
-		const minified = minifyNdjson(content);
-		if (minified !== undefined) {
-			return { content: minified, minified: minified.length < content.length };
+	// Each format falls through to the next candidate when it does not parse,
+	// so a mislabeled body is still returned unchanged rather than mangled.
+	return (
+		(kind === "ndjson" ? result(minifyNdjson(content)) : undefined) ??
+		(kind === "json" || trimmed.startsWith("{") || trimmed.startsWith("[")
+			? result(minifyJson(trimmed))
+			: undefined) ??
+		(kind === "xml" || trimmed.startsWith("<?xml")
+			? result(minifyXml(content))
+			: undefined) ??
+		(kind === "html" ? result(minifyHtml(content)) : undefined) ?? {
+			content,
+			minified: false,
 		}
-	}
-
-	if (
-		isJsonContentType(contentType) ||
-		trimmed.startsWith("{") ||
-		trimmed.startsWith("[")
-	) {
-		const minified = minifyJson(trimmed);
-		if (minified !== undefined) {
-			return { content: minified, minified: minified.length < content.length };
-		}
-	}
-
-	if (isXmlContentType(contentType) || trimmed.startsWith("<?xml")) {
-		const minified = minifyXml(content);
-		if (minified !== undefined) {
-			return { content: minified, minified: minified.length < content.length };
-		}
-	}
-
-	if (isHtmlContentType(contentType)) {
-		const minified = minifyHtml(content);
-		if (minified !== undefined) {
-			return { content: minified, minified: minified.length < content.length };
-		}
-	}
-
-	return { content, minified: false };
+	);
 };
