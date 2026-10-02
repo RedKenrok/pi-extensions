@@ -27,9 +27,20 @@ The extension listens for `agent_settled`, not `agent_end`, so it waits until re
 Configure with environment variables before starting Pi:
 
 - `PI_NOTIFY_MIN_RUN_MS`: minimum elapsed run time in milliseconds (default `10000`; `0` notifies on every settle). Invalid values use the default. If no start event was observed, the default filter skips the settle.
-- `PI_NOTIFY_METHOD`: `auto` (default), `kitty`, `osc777`, `toast`, or `off`. Explicit methods bypass terminal detection but still require a TUI and stdout TTY. Use `off` to disable notifications.
+- `PI_NOTIFY_METHOD`: `auto` (default), `kitty`, `osc777`, `osc9`, `toast`, or `off`. Explicit methods bypass terminal detection but still require a TUI and stdout TTY. Use `off` to disable notifications.
 
-`auto` selects a PowerShell toast when `WT_SESSION` is set and Pi runs on Windows or inside WSL (`WSL_DISTRO_NAME`); otherwise OSC 99 when `KITTY_WINDOW_ID` is set. Other terminals are not assumed to support notifications. To enable OSC 777 for a terminal that supports it, set `PI_NOTIFY_METHOD=osc777`. An inherited `WT_SESSION` in a remote Linux shell does not select PowerShell.
+`auto` selects the first matching backend in this order:
+
+| Backend | Detection |
+| --- | --- |
+| PowerShell toast | `WT_SESSION` is set and Pi runs on Windows or inside WSL (`WSL_DISTRO_NAME`) |
+| Kitty OSC 99 | `KITTY_WINDOW_ID` is set |
+| OSC 777 | `TERM_PROGRAM` is `CotEditorPatch` or `WezTerm`, or `TERM` is `foot` or `foot-extra` |
+| OSC 9 | `TERM_PROGRAM` is `iTerm.app` (iTerm2) or `ghostty` |
+
+`CotEditorPatch` is set by the shell tabs of the CotEditorPatch builds of CotEditor, which show OSC 777 as macOS notifications; plain CotEditor has no shell tabs. OSC 9 has a single message field, so the project title and session body are combined into one message. VS Code and unknown terminals are not assumed to support desktop notifications. An inherited `WT_SESSION` in a remote Linux shell does not select PowerShell.
+
+Detection uses environment hints, not a capability probe. Foot's `TERM` value is only a heuristic and can be customized. Multiplexers and SSH can replace or omit terminal identifiers; inherited values can also be misleading. Set `PI_NOTIFY_METHOD=osc777`, `osc9`, or `kitty` to explicitly select your terminal's protocol there; inside tmux, also enable passthrough as described below.
 
 Kitty notifications use unique IDs; Kitty's default click action focuses the originating window. Other terminals' click behavior is terminal-dependent. The extension does not switch tabs or navigate to a Pi session on click.
 
@@ -57,4 +68,6 @@ The extension makes no network requests and does not send conversation content o
 
 ## Development
 
-From the repository root, run `npm run lint`, `npm run test`, and `npm run test:coverage`. The tests cover lifecycle and non-interactive behavior, terminal and platform selection, Kitty IDs, tmux passthrough, label sanitization and toast escaping, the queued latest toast, run-duration filtering, delivery failures, and debug diagnostics. They do not validate OS-level notification display or click behavior; test those manually in your terminal.
+From the repository root, run `npm run lint`, `npm run test`, and `npm run test:coverage`. To add a delivery backend, add an entry to the ordered registry in `index.ts` with `matches` and `send` functions. Its key becomes an accepted `PI_NOTIFY_METHOD` value; registry order determines automatic precedence. Add tests for detection, explicit selection, and protocol output.
+
+The tests cover lifecycle and non-interactive behavior, terminal and platform selection, OSC 9 output, Kitty IDs, tmux passthrough, label sanitization and toast escaping, the queued latest toast, run-duration filtering, delivery failures, and debug diagnostics. They do not validate OS-level notification display or click behavior; test those manually in your terminal.

@@ -10,16 +10,14 @@ import { createDiagnostics } from "shared/diagnostics";
 const PACKAGE_NAME = "notify";
 const TOAST_TIMEOUT_MS = 3000;
 const DEFAULT_MIN_RUN_MS = 10_000;
-type Delivery = "auto" | "off" | "kitty" | "osc777" | "toast";
+type Backends = ReturnType<typeof createBackends>;
+type Delivery = "auto" | "off" | keyof Backends;
 
-function delivery(env: NodeJS.ProcessEnv): Delivery {
+function delivery(env: NodeJS.ProcessEnv, backends: Backends): Delivery {
 	const value = env.PI_NOTIFY_METHOD;
-	return value === "off" ||
-		value === "kitty" ||
-		value === "osc777" ||
-		value === "toast"
-		? value
-		: "auto";
+	if (value === "off") return "off";
+	if (value && Object.hasOwn(backends, value)) return value as keyof Backends;
+	return "auto";
 }
 
 function minimumRunMs(env: NodeJS.ProcessEnv): number {
@@ -133,6 +131,74 @@ const defaultOptions = (): NotifyOptions => ({
 	now: () => performance.now(),
 });
 
+type NotificationText = ReturnType<typeof notificationText>;
+type Backend = {
+	matches: () => boolean;
+	send: (text: NotificationText) => void;
+};
+
+// Entries are checked in order for automatic delivery. Add a backend here to
+// support both automatic detection and an explicit PI_NOTIFY_METHOD value.
+function createBackends(
+	options: NotifyOptions,
+	toast: (script: string) => void,
+) {
+	return {
+		toast: {
+			// WT_SESSION can reach remote shells without powershell.exe.
+			matches: () =>
+				Boolean(options.env.WT_SESSION) &&
+				(options.platform === "win32" || Boolean(options.env.WSL_DISTRO_NAME)),
+			send: ({ title, body }) => toast(windowsToastScript(title, body)),
+		},
+		kitty: {
+			matches: () => Boolean(options.env.KITTY_WINDOW_ID),
+			send: ({ title, body }) => {
+				// Unique IDs prevent separate threads/runs from replacing one another.
+				// Kitty's default click action focuses the originating window.
+				const id = randomUUID();
+				const end = oscEnd(options.env);
+				options.write(
+					forTerminal(`\x1b]99;i=${id}:d=0;${title}${end}`, options.env) +
+						forTerminal(`\x1b]99;i=${id}:p=body;${body}${end}`, options.env),
+				);
+			},
+		},
+		osc777: {
+			// TERM_PROGRAM identifies CotEditorPatch and WezTerm; foot only offers
+			// a TERM hint. These values can be replaced by nested terminals.
+			matches: () =>
+				["CotEditorPatch", "WezTerm"].includes(
+					options.env.TERM_PROGRAM ?? "",
+				) || ["foot", "foot-extra"].includes(options.env.TERM ?? ""),
+			send: ({ title, body }) => {
+				options.write(
+					forTerminal(`\x1b]777;notify;${title};${body}\x07`, options.env),
+				);
+			},
+		},
+		osc9: {
+			matches: () =>
+				["iTerm.app", "ghostty"].includes(options.env.TERM_PROGRAM ?? ""),
+			send: ({ title, body }) => {
+				// OSC 9 has only one message field, so include the title inline.
+				options.write(forTerminal(`\x1b]9;${title}: ${body}\x07`, options.env));
+			},
+		},
+	} satisfies Record<string, Backend>;
+}
+
+function selectBackend(
+	method: Delivery,
+	backends: Backends,
+): Backend | undefined {
+	if (method === "off") return undefined;
+	if (method === "auto") {
+		return Object.values(backends).find((backend) => backend.matches());
+	}
+	return backends[method];
+}
+
 export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
 	const options: NotifyOptions = { ...defaultOptions(), ...overrides };
 	const debug = createDiagnostics(PACKAGE_NAME, {
@@ -169,13 +235,8 @@ export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
 		}
 	};
 
-	// WT_SESSION is inherited by nested and remote shells, where powershell.exe
-	// does not exist, so it only selects toasts on Windows or inside WSL.
-	const useToast = () =>
-		Boolean(options.env.WT_SESSION) &&
-		(options.platform === "win32" || Boolean(options.env.WSL_DISTRO_NAME));
-
-	const method = delivery(options.env);
+	const backends = createBackends(options, toast);
+	const method = delivery(options.env, backends);
 	const minRunMs = minimumRunMs(options.env);
 	let startedAt: number | undefined;
 	return (pi: ExtensionAPI) => {
@@ -192,34 +253,11 @@ export function createNotifyExtension(overrides: Partial<NotifyOptions> = {}) {
 				(start === undefined || options.now() - start < minRunMs)
 			)
 				return;
-			const selected =
-				method === "auto"
-					? useToast()
-						? "toast"
-						: options.env.KITTY_WINDOW_ID
-							? "kitty"
-							: "off"
-					: method;
-			if (selected === "off") return;
+			const backend = selectBackend(method, backends);
+			if (!backend) return;
 			// Delivery is best-effort; a broken terminal or toast must not fail Pi's run.
 			try {
-				const { title, body } = notificationText(ctx);
-				if (selected === "toast") {
-					toast(windowsToastScript(title, body));
-				} else if (selected === "kitty") {
-					// Unique IDs prevent separate threads/runs from replacing one another.
-					// Kitty's default click action focuses the originating window.
-					const id = randomUUID();
-					const end = oscEnd(options.env);
-					options.write(
-						forTerminal(`\x1b]99;i=${id}:d=0;${title}${end}`, options.env) +
-							forTerminal(`\x1b]99;i=${id}:p=body;${body}${end}`, options.env),
-					);
-				} else {
-					options.write(
-						forTerminal(`\x1b]777;notify;${title};${body}\x07`, options.env),
-					);
-				}
+				backend.send(notificationText(ctx));
 			} catch {
 				debug("write_failed");
 			}

@@ -51,7 +51,9 @@ function harness(
 	createNotifyExtension({
 		env: {
 			PI_NOTIFY_METHOD:
-				env.KITTY_WINDOW_ID || env.WT_SESSION ? "auto" : "osc777",
+				env.KITTY_WINDOW_ID || env.WT_SESSION || env.TERM_PROGRAM
+					? "auto"
+					: "osc777",
 			PI_NOTIFY_MIN_RUN_MS: "0",
 			...env,
 		},
@@ -144,6 +146,140 @@ test("defaults to known terminals only and supports explicit delivery or opt-out
 	const off = harness({ PI_NOTIFY_METHOD: "off", KITTY_WINDOW_ID: "1" });
 	off.settle();
 	assert.deepEqual(off.output, []);
+});
+
+test("explicit toast bypasses detection and takes precedence over terminal backends", () => {
+	const runtime = harness({
+		PI_NOTIFY_METHOD: "toast",
+		KITTY_WINDOW_ID: "1",
+		TERM_PROGRAM: "CotEditorPatch",
+	});
+	runtime.settle();
+	assert.equal(runtime.toasts.length, 1);
+	assert.deepEqual(runtime.output, []);
+});
+
+test("invalid methods fall back to automatic detection, not inherited registry properties", () => {
+	for (const method of ["unknown", "toString", "constructor", "__proto__"]) {
+		const known = harness({
+			PI_NOTIFY_METHOD: method,
+			TERM_PROGRAM: "CotEditorPatch",
+		});
+		known.settle();
+		assert.ok(known.output[0]?.startsWith("\x1b]777;"));
+
+		const unknown = harness({ PI_NOTIFY_METHOD: method });
+		unknown.settle();
+		assert.deepEqual(unknown.output, []);
+		assert.deepEqual(unknown.toasts, []);
+	}
+});
+
+test("CotEditorPatch's shell tabs get OSC 777 unless kitty runs inside them", () => {
+	const cotEditor = harness(
+		{ TERM_PROGRAM: "CotEditorPatch" },
+		"tui",
+		"Review",
+	);
+	cotEditor.settle();
+	assert.deepEqual(cotEditor.output, [
+		"\x1b]777;notify;Pi: my-project;Review (abc12345): Ready for input\x07",
+	]);
+	const kittyInside = harness({
+		TERM_PROGRAM: "CotEditorPatch",
+		KITTY_WINDOW_ID: "1",
+	});
+	kittyInside.settle();
+	assert.ok(kittyInside.output[0]?.startsWith("\x1b]99;"));
+	const other = harness({ TERM_PROGRAM: "Apple_Terminal" });
+	other.settle();
+	assert.deepEqual(other.output, []);
+	const optedOut = harness({
+		TERM_PROGRAM: "CotEditorPatch",
+		PI_NOTIFY_METHOD: "off",
+	});
+	optedOut.settle();
+	assert.deepEqual(optedOut.output, []);
+});
+
+test("WezTerm and foot automatically use OSC 777", () => {
+	for (const env of [
+		{ TERM_PROGRAM: "WezTerm" },
+		{ TERM: "foot" },
+		{ TERM: "foot-extra" },
+	]) {
+		const runtime = harness({ PI_NOTIFY_METHOD: "auto", ...env });
+		runtime.settle();
+		assert.deepEqual(runtime.output, [
+			"\x1b]777;notify;Pi: my-project;Thread (abc12345): Ready for input\x07",
+		]);
+	}
+});
+
+test("iTerm2 and Ghostty automatically use OSC 9 with title and body inline", () => {
+	for (const terminal of ["iTerm.app", "ghostty"]) {
+		const runtime = harness({ TERM_PROGRAM: terminal });
+		runtime.settle();
+		assert.deepEqual(runtime.output, [
+			"\x1b]9;Pi: my-project: Thread (abc12345): Ready for input\x07",
+		]);
+	}
+});
+
+test("OSC 9 supports explicit selection, sanitization, and multiplexer passthrough", () => {
+	for (const env of [{}, { TMUX: "/tmp/tmux" }, { STY: "screen" }]) {
+		const runtime = harness(
+			{ ...env, PI_NOTIFY_METHOD: "osc9", KITTY_WINDOW_ID: "1" },
+			"tui",
+			"Review;\n\x1bchanges",
+		);
+		runtime.settle();
+		const sequence =
+			"\x1b]9;Pi: my-project: Review changes (abc12345): Ready for input\x07";
+		let expected = sequence;
+		if ("TMUX" in env) {
+			expected = `\x1bPtmux;${sequence.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`;
+		} else if ("STY" in env) {
+			expected = `\x1bP${sequence}\x1b\\`;
+		}
+		assert.deepEqual(runtime.output, [expected]);
+	}
+});
+
+test("newly supported terminals preserve precedence and opt-out", () => {
+	for (const terminal of ["WezTerm", "iTerm.app", "ghostty"]) {
+		const kitty = harness({ TERM_PROGRAM: terminal, KITTY_WINDOW_ID: "1" });
+		kitty.settle();
+		assert.ok(kitty.output[0]?.startsWith("\x1b]99;"));
+
+		const windows = harness(
+			{ TERM_PROGRAM: terminal, WT_SESSION: "session" },
+			"tui",
+			undefined,
+			{ platform: "win32" },
+		);
+		windows.settle();
+		assert.equal(windows.toasts.length, 1);
+		assert.deepEqual(windows.output, []);
+
+		const off = harness({ TERM_PROGRAM: terminal, PI_NOTIFY_METHOD: "off" });
+		off.settle();
+		assert.deepEqual(off.output, []);
+	}
+});
+
+test("VS Code and generic TERM values do not automatically notify", () => {
+	for (const env of [
+		{ TERM_PROGRAM: "vscode" },
+		{ TERM: "xterm-256color" },
+		{ TERM: "screen-256color" },
+		{ TERM: "tmux-256color" },
+	]) {
+		const runtime = harness({ PI_NOTIFY_METHOD: "auto", ...env });
+		runtime.settle();
+		assert.deepEqual(runtime.output, []);
+		assert.deepEqual(runtime.toasts, []);
+	}
 });
 
 test("minimum run duration filters short and consecutive settles", () => {
